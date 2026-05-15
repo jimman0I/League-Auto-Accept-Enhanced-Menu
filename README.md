@@ -20,7 +20,6 @@ A lightweight, Python-based desktop tool that interfaces with the **League of Le
 - 💬 **Auto Chat** – Sends custom messages in the champion select lobby
 - 🛡️ **Anti-AFK** – Prevents in-game disconnects by simulating activity when idle
 - 💾 **Persistent Config** – Saves your preferences to `lol_config.json` between sessions
-- 🖥️ **Hextech-Themed GUI** – Clean, responsive Tkinter interface with real-time phase tracking & live logs
 - 🔌 **Zero Dependencies** – Uses Python's standard library + `requests`
 
 ## ⚙️ How It Works
