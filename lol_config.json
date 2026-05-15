@@ -1,0 +1,69 @@
+{
+  "roles": {
+    "TOP": {
+      "pick_id": 86,
+      "pick_name": "Garen",
+      "ban_id": 54,
+      "ban_name": "Malphite",
+      "spell1_id": 4,
+      "spell1_name": "Flash",
+      "spell2_id": 14,
+      "spell2_name": "Ignite",
+      "rune_id": 2099826543,
+      "rune_name": "New Runes Page 3"
+    },
+    "JUNGLE": {
+      "pick_id": 20,
+      "pick_name": "Nunu & Willump",
+      "ban_id": 141,
+      "ban_name": "Kayn",
+      "spell1_id": 4,
+      "spell1_name": "Flash",
+      "spell2_id": 21,
+      "spell2_name": "Barrier",
+      "rune_id": 404621553,
+      "rune_name": "backup"
+    },
+    "MIDDLE": {
+      "pick_id": 36,
+      "pick_name": "Dr. Mundo",
+      "ban_id": 90,
+      "ban_name": "Malzahar",
+      "spell1_id": 4,
+      "spell1_name": "Flash",
+      "spell2_id": 6,
+      "spell2_name": "Ghost",
+      "rune_id": 1154762783,
+      "rune_name": "Porofessor: Sejuani - Diamond+"
+    },
+    "BOTTOM": {
+      "pick_id": 360,
+      "pick_name": "Samira",
+      "ban_id": 25,
+      "ban_name": "Morgana",
+      "spell1_id": 4,
+      "spell1_name": "Flash",
+      "spell2_id": 21,
+      "spell2_name": "Barrier",
+      "rune_id": 1312215072,
+      "rune_name": "Blitz: Malphite"
+    },
+    "UTILITY": {
+      "pick_id": 223,
+      "pick_name": "Tahm Kench",
+      "ban_id": 84,
+      "ban_name": "Akali",
+      "spell1_id": 4,
+      "spell1_name": "Flash",
+      "spell2_id": 7,
+      "spell2_name": "Heal",
+      "rune_id": 1154762783,
+      "rune_name": "Porofessor: Sejuani - Diamond+"
+    }
+  },
+  "chat_on": false,
+  "chat_msg": "GLHF",
+  "auto_accept": true,
+  "afk_on": true,
+  "afk_threshold": 15
+}
