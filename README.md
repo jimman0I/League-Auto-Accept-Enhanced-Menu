@@ -30,6 +30,8 @@ It interacts **only** with Riot's official local client API (`lockfile` auth ove
 4. On first launch, pick your item build source. Configure picks, bans, runes, spells, and toggles in the UI.
 5. Leave it running — it acts automatically at the right moments.
 
+> **First-run warning:** because the exe isn't code-signed, Windows SmartScreen may show *"Windows protected your PC"* the first time you run it. Click **More info → Run anyway**. This is expected for small open-source tools and the prompt goes away on its own as more people download it.
+
 ## ⬆️ Auto-Update
 
 You don't need to re-download the app to get new versions. On every launch, Hextech Draft quietly checks this repo's GitHub Releases. When a newer release is published, an **"⬆ UPDATE AVAILABLE"** banner appears in the header — click it and the app downloads the new `.exe`, swaps itself out, and restarts. No manual reinstall required.
