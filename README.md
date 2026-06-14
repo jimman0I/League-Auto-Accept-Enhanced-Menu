@@ -1,44 +1,66 @@
-Here's a ready-to-use GitHub repository description. You can paste the short version into the repo's **"About"** section, and use the full markdown for your `README.md`.
+# ⚔️ Hextech Draft — League Auto-Accept (Enhanced Menu)
+
+A lightweight Windows desktop app that talks to the **League of Legends Client API (LCU)** to automate the boring parts of getting into a game — accepting queues, picking/banning, applying runes & spells, and more — wrapped in a clean, themeable Hextech-styled interface.
+
+It interacts **only** with Riot's official local client API (`lockfile` auth over the documented REST endpoints). It does **not** read or write game memory, inject DLLs, or modify client files.
 
 ---
-
-### 🔹 Short Tagline (for GitHub "About" section)
-`Automate League of Legends queue acceptance, champion select, runes, spells, chat, and anti-AFK using the official LCU API.`
-
----
-
-### 📘 Full README Description
-
-# ⚔️ League Auto-Accept
-
-A lightweight, Python-based desktop tool that interfaces with the **League of Legends Client API (LCU)** to automate repetitive pre-game and in-game tasks. Built for convenience, reliability, and a clean aesthetic, it handles matchmaking acceptance, champion selection, loadout configuration, lobby chat, and AFK prevention—all without modifying game memory or injecting code.
 
 ## ✨ Features
-- 🟢 **Auto Accept** – Instantly accepts ready checks & matchmaking queues
-- 🎯 **Auto Pick/Ban** – Selects and **locks in** your preferred champion automatically
-- 📖 **Auto Runes & Spells** – Applies preset summoner spells and rune pages after lock-in
-- 💬 **Auto Chat** – Sends custom messages in the champion select lobby
-- 🛡️ **Anti-AFK** – Prevents in-game disconnects by simulating activity when idle
-- 💾 **Persistent Config** – Saves your preferences to `lol_config.json` between sessions
-- 🔌 **Zero Dependencies** – Uses Python's standard library + `requests`
+
+- 🟢 **Auto Accept** — instantly accepts ready checks / matchmaking queues
+- 🎯 **Auto Pick & Ban** — selects and **locks in** your preferred champion per role, with tag filters and favorites
+- 📖 **Auto Runes** — fetches recommended rune pages from **U.GG** and applies them after lock-in
+- ✨ **Auto Spells** — applies your preset summoner spells (with one-click swap)
+- 🛒 **Item Builds** — pulls recommended builds from your choice of **U.GG**, **Blitz.gg**, or **Lolalytics**
+- 💬 **Auto Chat** — sends custom messages in champion select
+- 🛡️ **Anti-AFK** — prevents idle disconnects
+- 🚪 **Dodge** — bail out of a lobby in one click
+- 🧩 **Per-Role Configs** — independent picks, bans, runes, and spells for every position
+- 🎨 **Themes & Zoom** — light / lite modes and adjustable UI scale
+- 🌍 **Region Aware** — set your region for build lookups
+- 💾 **Persistent Config** — settings saved to `lol_config.json` between sessions
+- ⬆️ **Built-in Auto-Update** — checks GitHub Releases on launch and updates itself in place (see below)
+
+## 🚀 Quick Start (no Python needed)
+
+1. Download the latest **`HextechDraft.exe`** from the [**Releases**](https://github.com/jimman0I/League-Auto-Accept-Enhanced-Menu/releases/latest) page.
+2. Launch the League of Legends client and log in.
+3. Run `HextechDraft.exe`. It auto-connects to your running client.
+4. On first launch, pick your item build source. Configure picks, bans, runes, spells, and toggles in the UI.
+5. Leave it running — it acts automatically at the right moments.
+
+## ⬆️ Auto-Update
+
+You don't need to re-download the app to get new versions. On every launch, Hextech Draft quietly checks this repo's GitHub Releases. When a newer release is published, an **"⬆ UPDATE AVAILABLE"** banner appears in the header — click it and the app downloads the new `.exe`, swaps itself out, and restarts. No manual reinstall required.
+
+> Maintainer note: to ship an update, bump `APP_VERSION` in `hextech_auto_accept.py`, rebuild the exe, and publish a new GitHub Release whose tag matches the version (e.g. `v1.0.1`) with the `.exe` attached as a release asset.
+
+## 🛠️ Run / Build from Source
+
+```bash
+# Python 3.10+ on Windows
+pip install -r requirements.txt
+
+# Run directly
+python hextech_auto_accept.py
+
+# Or build a standalone exe (output: dist/HextechDraft.exe)
+build_exe.bat
+```
 
 ## ⚙️ How It Works
-The application connects to the running League Client via its local REST API, authenticates using the `lockfile`, and continuously monitors the game flow phase (`ReadyCheck`, `ChampSelect`, `InProgress`). Actions are triggered automatically at the correct moments, ensuring smooth execution without manual input.
 
-## 🚀 Quick Start
-1. Ensure Python 3.8+ is installed
-2. Install dependencies: `pip install requests`
-3. Run the client normally
-4. Execute: `python lol_auto_accept_gui.py`
-5. Configure picks, bans, spells, runes, and toggles via the GUI
-6. The app will auto-connect and run in the background
+The app discovers the running League client via its `lockfile`, authenticates against the local LCU REST API, and polls the game-flow phase (`ReadyCheck`, `ChampSelect`, `InProgress`). Each automation is triggered at the correct phase, so everything happens hands-free.
 
 ## ⚠️ Disclaimer
-This tool interacts **only** with the official League Client API (LCU) through documented local endpoints. It does **not** read/write game memory, inject DLLs, or modify client files. Use at your own discretion. Riot Games does not officially endorse or support third-party automation tools.
 
-## 🛠️ Tech Stack
-`Python 3` • `Tkinter` • `Requests` • `ctypes` • `LCU REST API`
+This is a third-party convenience tool that uses only the official, documented LCU endpoints. It does not modify the game. Automation tools are not officially endorsed by Riot Games — use at your own discretion.
 
----
+## 🧰 Tech Stack
 
-💡 *Tip for your repo:* Add a `requirements.txt` with just `requests` and a `LICENSE` file (MIT is common for tools like this). Let me know if you want a badge setup, installation script, or automated release workflow!
+`Python 3` • `pywebview` • `requests` • `psutil` • `LCU REST API` • `PyInstaller`
+
+## 📄 License
+
+[MIT](LICENSE) © jimman0I

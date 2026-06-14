@@ -1,2 +1,11 @@
 lol_config.json
 LeagueAutoAccept.exe
+
+# Build artifacts
+build/
+dist/
+__pycache__/
+*.pyc
+*.update
+*.update.exe
+_update.bat
