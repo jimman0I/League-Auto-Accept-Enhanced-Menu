@@ -64,7 +64,9 @@ The app discovers the running League client via its `lockfile`, authenticates ag
 
 ## ⚠️ Disclaimer
 
-This is a third-party convenience tool that uses only the official, documented LCU endpoints. It does not modify the game. Automation tools are not officially endorsed by Riot Games — use at your own discretion.
+This is a third-party convenience tool that uses only the official, documented LCU endpoints — no memory reads, no DLL injection, no client file modification.
+
+That said, Riot's Terms of Service restrict "automation of any process normally performed by the player." Auto-accept and rune/spell/build import are widely used and generally low-risk conveniences. **Auto-pick, auto-ban, and auto-chat automate actual gameplay decisions and sit closer to that line** — Riot has not endorsed this tool, and using automated pick/ban carries real (if inconsistently enforced) account-action risk. Toggle those features off if you want to stay clearly on the safe side; they're opt-in, not required for the rest of the app to work.
 
 ## 🧰 Tech Stack
 
