@@ -68,6 +68,8 @@ This is a third-party convenience tool that uses only the official, documented L
 
 That said, Riot's Terms of Service restrict "automation of any process normally performed by the player." Auto-accept and rune/spell/build import are widely used and generally low-risk conveniences. **Auto-pick, auto-ban, and auto-chat automate actual gameplay decisions and sit closer to that line** — Riot has not endorsed this tool, and using automated pick/ban carries real (if inconsistently enforced) account-action risk. Toggle those features off if you want to stay clearly on the safe side; they're opt-in, not required for the rest of the app to work.
 
+The champ-select **personal winrate display** (per-champion win rate pulled from your own match history) falls under the same restriction — Riot staff have flagged in-client winrate/stat overlays generally, not just automation, as against the rules. Same disclaimer applies: use at your own risk.
+
 ## 🧰 Tech Stack
 
 `Python 3` • `pywebview` • `requests` • `psutil` • `LCU REST API` • `PyInstaller`
