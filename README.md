@@ -9,6 +9,8 @@ A lightweight Windows desktop app that talks to the **League of Legends Client A
 
 It interacts **only** with Riot's official local client API (`lockfile` auth over the documented REST endpoints). It does **not** read or write game memory, inject DLLs, or modify client files.
 
+![Hextech Draft screenshot](docs/screenshot.webp)
+
 ---
 
 ## ✨ Features
