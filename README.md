@@ -1,5 +1,10 @@
 # ⚔️ Hextech Draft — League Auto-Accept (Enhanced Menu)
 
+[![Latest Release](https://img.shields.io/github/v/release/jimman0I/League-Auto-Accept-Enhanced-Menu?label=release&color=C89B3C)](https://github.com/jimman0I/League-Auto-Accept-Enhanced-Menu/releases/latest)
+[![Downloads](https://img.shields.io/github/downloads/jimman0I/League-Auto-Accept-Enhanced-Menu/total?color=0AC8B9)](https://github.com/jimman0I/League-Auto-Accept-Enhanced-Menu/releases)
+[![License](https://img.shields.io/github/license/jimman0I/League-Auto-Accept-Enhanced-Menu?color=1E2328)](LICENSE)
+[![Stars](https://img.shields.io/github/stars/jimman0I/League-Auto-Accept-Enhanced-Menu?style=social)](https://github.com/jimman0I/League-Auto-Accept-Enhanced-Menu/stargazers)
+
 A lightweight Windows desktop app that talks to the **League of Legends Client API (LCU)** to automate the boring parts of getting into a game — accepting queues, picking/banning, applying runes & spells, and more — wrapped in a clean, themeable Hextech-styled interface.
 
 It interacts **only** with Riot's official local client API (`lockfile` auth over the documented REST endpoints). It does **not** read or write game memory, inject DLLs, or modify client files.
