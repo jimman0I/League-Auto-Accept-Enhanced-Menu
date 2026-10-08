@@ -4,13 +4,14 @@
 import json, os, sys, time, threading, subprocess, re
 import requests, urllib3
 from requests.auth import HTTPBasicAuth
+from concurrent.futures import ThreadPoolExecutor
 urllib3.disable_warnings()
 IS_WINDOWS = sys.platform == "win32"
 
 # ═══════════════════════════════════════════════════════════════
 #  VERSION & AUTO-UPDATE
 # ═══════════════════════════════════════════════════════════════
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 GITHUB_REPO = "jimman0I/League-Auto-Accept-Enhanced-Menu"  # owner/repo used for auto-update checks
 
 def check_for_update(log=None):
@@ -208,12 +209,52 @@ def fetch_runes_reforged():
 # ═══════════════════════════════════════════════════════════════
 
 VALID_ITEMS=set()
+ITEM_TAGS={}
 def load_valid_items():
-    global VALID_ITEMS
+    global VALID_ITEMS,ITEM_TAGS
     try:
         data=requests.get(f"https://ddragon.leagueoflegends.com/cdn/{DDRAGON_VER}/data/en_US/item.json",timeout=8).json()
         VALID_ITEMS=set(int(k) for k in data.get('data',{}).keys())
+        ITEM_TAGS={int(k):v.get('tags',[]) for k,v in data.get('data',{}).items()}
     except:pass
+
+# Free, no-AI-needed signal for "which build style is this item build" — from
+# ddragon's own item tags, not a guess. AP/AD split cleanly on their own tags;
+# tank/bruiser/burst/utility need combo rules since ddragon's tagging overlaps
+# them (e.g. both crit-carry and lethality items carry 'Damage'+pen tags) —
+# good enough to rank candidate builds against a stated preference, not meant
+# to be a precise classifier.
+_DPS_TAGS={'CriticalStrike','AttackSpeed','OnHit','LifeSteal'}
+_PEN_TAGS={'ArmorPenetration','MagicPenetration'}
+_BUILD_STYLES={'ap','ad','tank','bruiser','burst','utility'}
+
+def _item_matches_style(tags, style):
+    tags=set(tags)
+    if style=='ap':return bool(tags&{'SpellDamage','MagicPenetration','SpellVamp'})
+    if style=='ad':return bool(tags&_DPS_TAGS)
+    if style=='tank':return bool(tags&{'Armor','SpellBlock'}) and 'Damage' not in tags
+    if style=='bruiser':return 'Health' in tags and 'Damage' in tags
+    if style=='burst':return 'Damage' in tags and bool(tags&_PEN_TAGS) and not (tags&_DPS_TAGS) and 'Health' not in tags
+    if style=='utility':return bool(tags&{'Vision','Aura','GoldPer'})
+    return False
+
+def _style_score(items_dict, style):
+    """How well one gathered item build matches a build-style preference — count of
+    core/situational items whose ddragon tags hit that style's rule."""
+    if style not in _BUILD_STYLES or not items_dict:return 0
+    ids=(items_dict.get('core') or [])+(items_dict.get('situational') or [])
+    return sum(1 for iid in ids if _item_matches_style(ITEM_TAGS.get(iid,[]),style))
+
+def pick_items_by_style(candidates, style):
+    """Among gathered {"source","items"} candidates, return the items dict that best
+    matches the player's stated build-style preference — None if style is unset/'auto'
+    or there's nothing to compare (caller falls back to its usual logic)."""
+    if style not in _BUILD_STYLES or not candidates:return None
+    ranked=sorted(candidates,key=lambda c:_style_score(c['items'],style),reverse=True)
+    best=ranked[0]
+    if _style_score(best['items'],style)<=0 and len(candidates)>1:
+        return None  # nothing even loosely matches — don't force a bad pick, let the normal fallback run
+    return best['items']
 
 def _champ_url_name(champ_key):
     """Convert ddragon key to URL name for build sites."""
@@ -361,6 +402,220 @@ def fetch_lolalytics_build(champ_key, position, log=None):
     except Exception as e:
         _log(f"[DEBUG] Lolalytics error: {e}");return None,None,None
 
+# ═══════════════════════════════════════════════════════════════
+#  SMART PICK — team-comp balance + op.gg counter data
+# ═══════════════════════════════════════════════════════════════
+# op.gg server-renders champion/matchup blocks as a JSON string double-encoded
+# into the page (literal \" sequences, not real quotes) — same shape on both
+# the champions-by-position list and the per-champion counters page:
+#   \"play\":1890,\"win\":859,\"win_rate\":45.45,\"champion\":{\"image_url\":\"...\",\"name\":\"Darius\",\"key\":\"darius\"}
+_OPGG_MATCHUP_RE=re.compile(
+    r'\\"play\\":(\d+),\\"win\\":(\d+),\\"win_rate\\":([\d.]+),'
+    r'\\"champion\\":\{\\"image_url\\":\\"[^"\\]*\\",\\"name\\":\\"([^"\\]+)\\",\\"key\\":\\"([^"\\]+)\\"')
+# The champions-by-position list page embeds a different shape per row:
+#   \"key\":\"garen\",\"name\":\"Garen\",\"image_url\":\"...\",\"positionName\":\"TOP\",
+#   \"positionWinRate\":51.64,\"positionPickRate\":7.45,...
+_OPGG_POSITION_RE=re.compile(
+    r'\\"key\\":\\"([^"\\]+)\\",\\"name\\":\\"([^"\\]+)\\",\\"image_url\\":\\"[^"\\]*\\",'
+    r'\\"positionName\\":\\"[^"\\]*\\",\\"positionWinRate\\":([\d.]+),\\"positionPickRate\\":([\d.]+)')
+
+def _champ_opgg_key(champ_key):
+    """ddragon key -> op.gg's slug (lowercase, punctuation/spaces stripped)."""
+    if not champ_key:return None
+    return re.sub(r'[^a-z0-9]','',champ_key.lower())
+
+def fetch_role_pool(role, log=None):
+    """All champions commonly played in a role, with winrate, from op.gg."""
+    def _log(m):
+        if log:log(m)
+    pos_map={'TOP':'top','JUNGLE':'jungle','MIDDLE':'mid','BOTTOM':'adc','UTILITY':'support'}
+    pos=pos_map.get(role,'top')
+    try:
+        url=f"https://www.op.gg/champions?position={pos}&tier=gold_plus"
+        resp=requests.get(url,timeout=10,headers={
+            'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36','Accept':'text/html'})
+        if resp.status_code!=200:_log(f"[DEBUG] Role pool: HTTP {resp.status_code}");return []
+        out=[{"name":name,"key":key,"winRate":float(wr),"pickRate":float(pr)}
+             for key,name,wr,pr in _OPGG_POSITION_RE.findall(resp.text)]
+        _log(f"[DEBUG] Role pool {role}: {len(out)} champs from op.gg")
+        return out
+    except Exception as e:
+        _log(f"[DEBUG] Role pool error: {e}");return []
+
+def fetch_champion_counters(enemy_champ_key, role, log=None):
+    """Champions that beat `enemy_champ_key` in `role`, from op.gg's counters page.
+    Returns [{name,key,enemyWinRate}] — low enemyWinRate = strong counter to the enemy."""
+    def _log(m):
+        if log:log(m)
+    name=_champ_opgg_key(enemy_champ_key)
+    if not name:return []
+    pos_map={'TOP':'top','JUNGLE':'jungle','MIDDLE':'mid','BOTTOM':'adc','UTILITY':'support'}
+    pos=pos_map.get(role,'top')
+    try:
+        url=f"https://www.op.gg/champions/{name}/counters/{pos}"
+        resp=requests.get(url,timeout=8,headers={
+            'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36','Accept':'text/html'})
+        if resp.status_code!=200:return []
+        out=[{"name":cname,"key":ckey,"enemyWinRate":float(wr)}
+             for play,win,wr,cname,ckey in _OPGG_MATCHUP_RE.findall(resp.text)]
+        out.sort(key=lambda x:x['enemyWinRate'])
+        return out
+    except Exception as e:
+        _log(f"[DEBUG] Counters fetch error for {enemy_champ_key}: {e}");return []
+
+# Blitz's tier-list page server-renders each row as plain text spans (no embedded
+# JSON on this page, unlike its champion-build page) — stable, Svelte-generated class names:
+#   <span class="tier-champion-name ...">Camille</span> <span class="tier-champion-stat ...">53.5%</span>
+_BLITZ_TIER_RE=re.compile(
+    r'class="tier-champion-name[^"]*">([^<]+)</span>\s*<span class="tier-champion-stat[^"]*"[^>]*>([\d.]+)%')
+# Blitz's counters table reports a derived "matchup_score" per row (roughly a
+# percentage-point advantage, not a plain win rate) next to the champion name:
+#   .../Nasus/build?role=TOP" ...>Nasus</span>...matchup_score...>-52<
+_BLITZ_COUNTER_RE=re.compile(
+    r'/champions/([A-Za-z0-9\x27.]+)/build\?role=[A-Z]+"[^>]*>.*?class="name[^"]*">([^<]+)</span>.*?'
+    r'data-sort-key="matchup_score"[^>]*>.*?<!---->(-?\d+)<!---->',re.DOTALL)
+
+def fetch_blitz_role_pool(role, log=None):
+    """All champions commonly played in a role, with win rate, from blitz.gg's tier list."""
+    def _log(m):
+        if log:log(m)
+    pos_map={'TOP':'top','JUNGLE':'jungle','MIDDLE':'mid','BOTTOM':'adc','UTILITY':'support'}
+    pos=pos_map.get(role,'top')
+    try:
+        url=f"https://blitz.gg/lol/tierlist?role={pos}"
+        resp=requests.get(url,timeout=6,headers={
+            'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36','Accept':'text/html'})
+        if resp.status_code!=200:_log(f"[DEBUG] Blitz role pool: HTTP {resp.status_code}");return []
+        out=[{"name":name,"key":re.sub(r'[^a-z0-9]','',name.lower()),"winRate":float(wr),"pickRate":0.0}
+             for name,wr in _BLITZ_TIER_RE.findall(resp.text)]
+        _log(f"[DEBUG] Blitz role pool {role}: {len(out)} champs")
+        return out
+    except Exception as e:
+        _log(f"[DEBUG] Blitz role pool error: {e}");return []
+
+def fetch_blitz_counters(enemy_champ_key, role, log=None):
+    """Champions that beat `enemy_champ_key` in `role`, from blitz.gg's counters table.
+    Returns [{name,key,enemyWinRate}] — low enemyWinRate = strong counter, same contract
+    as fetch_champion_counters. Blitz's own "matchup_score" (roughly -100..100, higher is
+    better for enemy_champ_key) is linearly remapped to that scale — an approximation,
+    not a real win rate, but it sorts and thresholds the same way the op.gg one does."""
+    def _log(m):
+        if log:log(m)
+    name=_champ_url_name(enemy_champ_key)
+    if not name:return []
+    try:
+        url=f"https://blitz.gg/lol/champions/{name}/counters?role={role}"
+        resp=requests.get(url,timeout=6,headers={
+            'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36','Accept':'text/html'})
+        if resp.status_code!=200:return []
+        out=[{"name":cname,"key":re.sub(r'[^a-z0-9]','',cname.lower()),
+              "enemyWinRate":50.0-max(-50.0,min(50.0,float(score)*0.3))}
+             for ckey,cname,score in _BLITZ_COUNTER_RE.findall(resp.text)]
+        out.sort(key=lambda x:x['enemyWinRate'])
+        return out
+    except Exception as e:
+        _log(f"[DEBUG] Blitz counters fetch error for {enemy_champ_key}: {e}");return []
+
+def _bounded_parallel(tasks, timeout=8):
+    """Run zero-arg callables concurrently, with `timeout` seconds total shared
+    across ALL of them — not `timeout` seconds EACH. (Giving each future its
+    own fresh `result(timeout=N)` in a loop doesn't cap the total wait at N;
+    it caps it at N × count, since each subsequent wait restarts its clock
+    from "now" instead of a shared deadline — the bug that made a 5-way
+    fan-out take ~5× as long as a single bounded call.) `requests`' own
+    timeout= is only an inter-byte inactivity timeout (a server that trickles
+    data slowly can blow way past it), and `with ThreadPoolExecutor()` blocks
+    on exit until EVERY submitted task finishes, even ones we've individually
+    given up waiting on — so the pool is shut down WITHOUT waiting for
+    stragglers; they finish on their own time in the background and their
+    results are simply discarded. Returns results in task order, None for any
+    that didn't finish before the shared deadline or raised."""
+    if not tasks:return []
+    ex=ThreadPoolExecutor(max_workers=len(tasks))
+    try:
+        futs=[ex.submit(t) for t in tasks]
+        deadline=time.time()+timeout
+        out=[]
+        for f in futs:
+            try:out.append(f.result(timeout=max(0,deadline-time.time())))
+            except Exception:out.append(None)
+        return out
+    finally:
+        ex.shutdown(wait=False)
+
+def _ensemble_role_pool(role, log=None):
+    """op.gg + Blitz role pools, fanned out in parallel and merged by champion key.
+    Win/pick rate averaged over whichever sources actually returned that champion —
+    never hard-fails if one site is down or a page shape changes."""
+    def _log(m):
+        if log:log(m)
+    sources=[s or [] for s in _bounded_parallel([
+        lambda:fetch_role_pool(role,log),
+        lambda:fetch_blitz_role_pool(role,log),
+    ],timeout=5)]
+    merged={}
+    for src in sources:
+        for entry in src:
+            m=merged.setdefault(entry['key'],{"name":entry['name'],"key":entry['key'],"_wr":[],"_pr":[]})
+            m['_wr'].append(entry['winRate'])
+            if entry.get('pickRate'):m['_pr'].append(entry['pickRate'])
+    out=[{"name":m['name'],"key":m['key'],
+          "winRate":sum(m['_wr'])/len(m['_wr']),
+          "pickRate":(sum(m['_pr'])/len(m['_pr'])) if m['_pr'] else 0.0}
+         for m in merged.values()]
+    _log(f"[DEBUG] Ensemble role pool {role}: {len(out)} champs from {sum(1 for s in sources if s)} source(s)")
+    return out
+
+def _ensemble_counters(enemy_champ_key, role, log=None):
+    """op.gg + Blitz counter data for one enemy champion, merged by champion key."""
+    def _log(m):
+        if log:log(m)
+    sources=[s or [] for s in _bounded_parallel([
+        lambda:fetch_champion_counters(enemy_champ_key,role,log),
+        lambda:fetch_blitz_counters(enemy_champ_key,role,log),
+    ])]
+    merged={}
+    for src in sources:
+        for entry in src:
+            m=merged.setdefault(entry['key'],{"name":entry['name'],"key":entry['key'],"_wr":[]})
+            m['_wr'].append(entry['enemyWinRate'])
+    out=[{"name":m['name'],"key":m['key'],"enemyWinRate":sum(m['_wr'])/len(m['_wr'])} for m in merged.values()]
+    out.sort(key=lambda x:x['enemyWinRate'])
+    return out
+
+# Broad damage/role buckets derived from ddragon tags, used to score how well a
+# candidate fills a gap in the team's current composition (tank, AP, AD, etc).
+_TAG_GROUP={'Tank':'tank','Fighter':'bruiser','Mage':'ap','Assassin':'burst',
+            'Marksman':'ad_carry','Support':'utility'}
+
+def _comp_profile(champ_ids, champs_by_id):
+    """Count how many allies already fall into each damage/role bucket."""
+    counts={'tank':0,'bruiser':0,'ap':0,'burst':0,'ad_carry':0,'utility':0}
+    for cid in champ_ids:
+        c=champs_by_id.get(cid)
+        if not c:continue
+        for t in c.get('tags',[]):
+            g=_TAG_GROUP.get(t)
+            if g:counts[g]+=1
+    return counts
+
+def _comp_score(candidate, ally_profile, overrides=None, role=None):
+    """+10 per bucket the team is completely missing that this candidate fills,
+    -5 per bucket the team already has 2+ of (discourage stacking 3 AD carries).
+    `overrides` (champId_ROLE-string -> bucket) lets a user say how THEY actually
+    build a champion in a GIVEN ROLE — e.g. AP Nunu mid shouldn't carry over to
+    tank-jungle Nunu, since the same champion can mean a different build per role."""
+    override=(overrides or {}).get(f"{candidate.get('id')}_{role}") if role else None
+    buckets=[override] if override else [_TAG_GROUP.get(t) for t in candidate.get('tags',[])]
+    score=0.0;reasons=[]
+    for g in buckets:
+        if not g:continue
+        have=ally_profile.get(g,0)
+        tag_suffix=" (your build)" if override else ""
+        if have==0:score+=10;reasons.append(f"fills missing {g.replace('_',' ')}"+tag_suffix)
+        elif have>=2:score-=5;reasons.append(f"stacks {g.replace('_',' ')}"+tag_suffix)
+    return score,reasons
+
 def fetch_ddragon_items(champ_key, log=None):
     """Fetch Riot's default recommended items from ddragon."""
     def _log(m):
@@ -502,6 +757,27 @@ def fetch_recommended_spells(session, champ_id, position, champ_key=None, log=No
             if spells and len(spells)>=2:return spells
         except:pass
     return None
+
+def gather_item_candidates(champ_key, position, log=None):
+    """Items from every source that has any (not just the first match), for
+    pick_items_by_style() to weigh against the player's build-style preference.
+    Each candidate's 'name' is its source label. Sources are fanned out in
+    parallel (each has its own ~8-12s timeout) so total latency is bounded by
+    the slowest single source, not the sum of all three."""
+    def _log(m):
+        if log:log(m)
+    out=[]
+    if not champ_key:return out
+    def _one(src_name,fetcher):
+        try:
+            _,items,_=fetcher(champ_key,position,log=log)
+            if items and sum(len(v) for v in items.values())>=2:
+                return {"source":src_name,"items":items}
+        except Exception as e:
+            _log(f"[DEBUG] {src_name} item gather error: {e}")
+        return None
+    results=_bounded_parallel([(lambda n=n,f=f:_one(n,f)) for n,f in SOURCES.items()])
+    return [r for r in results if r]
 
 def write_item_set(session, summoner_id, champ_id, champ_name, items_data, log=None):
     """Write an item set to the LCU client."""
@@ -909,7 +1185,8 @@ class Config:
                'backup_spell2_id','backup_spell2_name','backup_spell2_img']
     GLOBAL_KEYS=['chat_on','chat_msg','auto_accept','afk_on','afk_threshold',
                  'auto_pick','auto_ban','auto_spells','auto_runes','auto_items','sound_alert',
-                 'light_mode','lite_mode','favorites','auto_minimize','region','build_source']
+                 'light_mode','lite_mode','favorites','auto_minimize','region','build_source',
+                 'smart_pick_pool','favorite_tags','build_style_tags','favorites_by_role']
     def __init__(self):
         self.lock=threading.Lock();self.roles={}
         for r in self.ROLES:
@@ -918,6 +1195,7 @@ class Config:
         self.chat_on=False;self.chat_msg="GLHF";self.auto_accept=True;self.afk_on=False;self.afk_threshold=30
         self.auto_pick=True;self.auto_ban=True;self.auto_spells=False;self.auto_runes=False;self.auto_items=False;self.sound_alert=True
         self.light_mode=False;self.lite_mode=False;self.favorites=[];self.auto_minimize=False;self.region='eune';self.build_source=''
+        self.smart_pick_pool='favorites';self.favorite_tags={};self.build_style_tags={};self.favorites_by_role={}
     def snap(self,role='TOP'):
         with self.lock:
             d=dict(self.roles.get(role,self.roles['TOP']));d.update({k:getattr(self,k) for k in self.GLOBAL_KEYS});return d
@@ -950,7 +1228,7 @@ class Config:
 #  ENGINE
 # ═══════════════════════════════════════════════════════════════
 class Engine(threading.Thread):
-    def __init__(self,cfg,log):
+    def __init__(self,cfg,log,get_champs=None):
         super().__init__(daemon=True)
         self.cfg=cfg;self.log=log;self.session=None;self.connected=False;self.summoner=""
         self.phase="—";self.accepted=0;self.stop_flag=threading.Event();self._done=set()
@@ -964,6 +1242,10 @@ class Engine(threading.Thread):
         # Live champ select tracking
         self.cs_allies=[];self.cs_enemies=[];self.cs_bans=[]
         self.pause_pick=False
+        # Smart Pick — get_champs() returns the live Api.champs list (id/name/img/tags)
+        self.get_champs=get_champs or (lambda:[])
+        self.smart_pick_suggestion=None;self.smart_pick_alternatives=[]
+        self._smart_pick_sig=None;self._smart_pick_busy=False
     def stop(self):self.stop_flag.set()
     def run(self):
         while not self.stop_flag.is_set():
@@ -986,6 +1268,7 @@ class Engine(threading.Thread):
                 elif self.phase=="ChampSelect":self._cs()
                 else:
                     self._done.clear();self._warned_timer=False;self.pause_pick=False
+                    self.smart_pick_suggestion=None;self.smart_pick_alternatives=[];self._smart_pick_sig=None
                     if hasattr(self,'_cs_enter_time'):del self._cs_enter_time
                 self.stop_flag.wait(0.5)
             except Exception as e:self.log(f"Error: {e}");self.stop_flag.wait(2)
@@ -1085,7 +1368,19 @@ class Engine(threading.Thread):
         for m2 in ses.get('myTeam',[])+ses.get('theirTeam',[]):
             cid=m2.get('championId',0)
             if cid and m2.get('cellId')!=me:unavail.add(cid)
-        pick_id=snap.get('pick_id');pick_name=snap.get('pick_name','None');used_backup=False
+        # "SMART" is a per-role sentinel stored in pick_id (set by picking the Smart
+        # Pick tile in the champion grid, or armed for every role at once from the
+        # header button) — resolved live here instead of a fixed champion.
+        raw_pick_id=snap.get('pick_id');is_smart_role=(raw_pick_id=='SMART')
+        if is_smart_role:
+            self._update_smart_pick(snap,unavail)
+        pick_name=snap.get('pick_name','None');used_backup=False
+        if is_smart_role:
+            sp=self.smart_pick_suggestion
+            if sp and sp.get('id') not in unavail:pick_id=sp['id'];pick_name=sp.get('name','?')
+            else:pick_id=None
+        else:
+            pick_id=raw_pick_id
         if pick_id and int(pick_id) in unavail:
             if snap.get('backup_id'):
                 self.log(f"{pick_name} taken → {snap['backup_name']}");pick_id=snap['backup_id'];pick_name=snap['backup_name'];used_backup=True
@@ -1101,7 +1396,7 @@ class Engine(threading.Thread):
                 except:pass
         elif self.cs_time_left>5:self._warned_timer=False
         # HOVER PICK
-        if my_pick and pick_id and my_pick['id'] not in self._done:
+        if my_pick and pick_id and my_pick['id'] not in self._done and not self.pause_pick:
             about_to_ban=(ban_ready and snap['ban_id'] and my_ban['id'] not in self._done and self.cs_timer_phase not in ('PLANNING','') and secs_in>=8)
             if not about_to_ban:
                 try:self.session.patch(f"{self.session._base}/lol-champ-select/v1/session/actions/{my_pick['id']}",json={"championId":int(pick_id)},timeout=2)
@@ -1118,7 +1413,7 @@ class Engine(threading.Thread):
                 r2=self.session.patch(url,json={"championId":cid,"completed":True},timeout=3)
                 if r2.status_code in (200,204):
                     self._done.add(aid);self.stats['bans']+=1;self.log(f"[SUCCESS] Banned {snap['ban_name']}")
-                    if my_pick and pick_id and my_pick['id'] not in self._done:
+                    if my_pick and pick_id and my_pick['id'] not in self._done and not self.pause_pick:
                         time.sleep(0.3)
                         try:self.session.patch(f"{self.session._base}/lol-champ-select/v1/session/actions/{my_pick['id']}",json={"championId":int(pick_id)},timeout=2)
                         except:pass
@@ -1135,6 +1430,93 @@ class Engine(threading.Thread):
                     self._done.add(aid);self.stats['picks']+=1;self.log(f"[SUCCESS] Locked {pick_name}")
                     time.sleep(0.5);self._after_pick(snap,used_backup)
             except:pass
+
+    def _update_smart_pick(self,snap,unavail):
+        """Kick off a background recompute when the visible comp changes.
+        Never blocks _cs() — the live poll loop must stay fast for timely locking."""
+        role=self.detected_role
+        ally_ids=sorted(a['champId'] for a in self.cs_allies if a.get('champId'))
+        enemy_ids=sorted(e['champId'] for e in self.cs_enemies if e.get('champId'))
+        sig=(role,snap.get('smart_pick_pool'),tuple(ally_ids),tuple(enemy_ids),tuple(sorted(unavail)))
+        if sig==self._smart_pick_sig or self._smart_pick_busy:return
+        self._smart_pick_sig=sig
+        threading.Thread(target=self._smart_pick_worker,args=(role,snap.get('smart_pick_pool','favorites'),ally_ids,enemy_ids,set(unavail)),daemon=True).start()
+
+    def _smart_pick_worker(self,role,pool_mode,ally_ids,enemy_ids,unavail):
+        self._smart_pick_busy=True
+        try:
+            champs=self.get_champs()
+            if not champs:return
+            champs_by_id={c['id']:c for c in champs}
+            champs_by_name={c['name'].lower():c for c in champs}
+            # Candidate pool — local/instant for favorites, one network call for "all".
+            # Favorites (global + favorited-for-this-role) are ALWAYS unioned in,
+            # regardless of pool_mode — "all" means "meta picks PLUS my favorites",
+            # not "meta picks only, ignoring favorites". Without this, a champion
+            # you explicitly favorited for a role could still get excluded in 'all'
+            # mode just because op.gg/Blitz's aggregate stats don't show them
+            # commonly played there (e.g. an off-meta favorite).
+            candidates={}
+            fav_ids=set(self.cfg.favorites or [])|set(self.cfg.favorites_by_role.get(role,[]) or [])
+            for cid in fav_ids:
+                c=champs_by_id.get(cid)
+                if c and cid not in unavail:candidates[cid]=c
+            if pool_mode=='all':
+                for entry in _ensemble_role_pool(role,log=self.log):
+                    c=champs_by_name.get(entry['name'].lower())
+                    if c and c['id'] not in unavail:candidates[c['id']]=c
+            candidates=list(candidates.values())
+            if not candidates:
+                self.smart_pick_suggestion=None;self.smart_pick_alternatives=[];return
+            ally_profile=_comp_profile(ally_ids,champs_by_id)
+            scored=[]
+            for c in candidates:
+                comp,reasons=_comp_score(c,ally_profile,overrides=self.cfg.favorite_tags,role=role)
+                scored.append({"id":c['id'],"name":c['name'],"img":c['img'],"score":comp,"reasons":reasons})
+            scored.sort(key=lambda x:x['score'],reverse=True)
+            # Comp-only result goes live immediately — always something ready by pick time,
+            # even if the counter-data fetches below are slow or the site is unreachable.
+            self.smart_pick_suggestion=scored[0];self.smart_pick_alternatives=scored[1:4]
+            if not enemy_ids:return
+            # Counter-pick refinement — fan out across ALL visible enemies in parallel
+            # via _bounded_parallel, so total latency for up to 5 enemies is bounded
+            # by one shared ~8s budget, not enemies-count × per-enemy latency.
+            # Sequential (and later, naively-"parallel"-but-still-serially-timed-out)
+            # versions of this were a ~35-75s stall that made Smart Pick — and the
+            # app generally — look hung right after a 5-enemy champ select.
+            # op.gg only here (not the op.gg+Blitz ensemble) — measured directly:
+            # 5 concurrent op.gg requests alone finish in ~2.4s, but nesting a 2nd
+            # source per enemy (up to 15 simultaneous connections across 2 hosts)
+            # degrades badly on at least one real machine, almost certainly a local
+            # network-stack/security-software connection-burst ceiling that no
+            # amount of `timeout=` tuning fixes. Blitz still backs the role-pool
+            # call (once per role, not 5×/pick) where that burst risk doesn't apply.
+            scored_by_id={s['id']:s for s in scored}
+            enemy_list=[(eid,champs_by_id.get(eid)) for eid in enemy_ids[:5]]
+            enemy_list=[(eid,ec) for eid,ec in enemy_list if ec]
+            if enemy_list:
+                tasks=[(lambda ec=ec:fetch_champion_counters(ec['img'],role,log=self.log)) for eid,ec in enemy_list]
+                results=_bounded_parallel(tasks,timeout=8)
+                for (eid,enemy_c),counters in zip(enemy_list,results):
+                    if not counters:continue
+                    counters_by_key={x['key']:x for x in counters}
+                    for c in candidates:
+                        key=_champ_opgg_key(c['img'])
+                        hit=counters_by_key.get(key)
+                        if not hit:continue
+                        bonus=max(0.0,50.0-hit['enemyWinRate'])*0.6
+                        if bonus<=0:continue
+                        s=scored_by_id.get(c['id'])
+                        if s:
+                            s['score']+=bonus
+                            s['reasons'].append(f"counters {enemy_c['name']} ({hit['enemyWinRate']:.0f}% WR)")
+            rescored=sorted(scored_by_id.values(),key=lambda x:x['score'],reverse=True)
+            self.smart_pick_suggestion=rescored[0];self.smart_pick_alternatives=rescored[1:4]
+            self.log(f"[DEBUG] Smart Pick: {rescored[0]['name']} ({rescored[0]['score']:.0f} pts)")
+        except Exception as e:
+            self.log(f"[DEBUG] Smart Pick error: {e}")
+        finally:
+            self._smart_pick_busy=False
 
     def _after_pick(self,snap,used_backup=False):
         if snap.get('auto_spells',True):
@@ -1197,10 +1579,17 @@ class Engine(threading.Thread):
             raw_id=snap.get('backup_id') if used_backup else snap.get('pick_id')
             champ_nm=snap.get('backup_name') if used_backup else snap.get('pick_name','?')
             if champ_img and raw_id:
+                items=None
                 try:champ_id_val=int(raw_id)
                 except:champ_id_val=0
                 if champ_id_val:
-                    items=fetch_recommended_items(self.session,champ_id_val,self.detected_role,champ_key=champ_img,log=self.log,source_pref=self.cfg.build_source)
+                    style=self.cfg.build_style_tags.get(f"{champ_id_val}_{self.detected_role}")
+                    if style in _BUILD_STYLES:
+                        style_cands=gather_item_candidates(champ_img,self.detected_role,log=self.log)
+                        items=pick_items_by_style(style_cands,style)
+                        if items:self.log(f"[SUCCESS] {style.upper()}-style item build (your preference)")
+                    if not items:
+                        items=fetch_recommended_items(self.session,champ_id_val,self.detected_role,champ_key=champ_img,log=self.log,source_pref=self.cfg.build_source)
                 if items:
                     sid=self._get_summoner_id()
                     if sid:write_item_set(self.session,sid,champ_id_val,champ_nm,items,log=self.log)
@@ -1264,7 +1653,7 @@ class Api:
         self.logs.append({"time":ts,"msg":msg,"type":"success" if "[SUCCESS]" in msg else ("debug" if "[DEBUG]" in msg else "info")})
         if len(self.logs)>80:self.logs=self.logs[-80:]
     def _init(self):
-        self.engine=Engine(self.cfg,self._log);self.engine.start()
+        self.engine=Engine(self.cfg,self._log,lambda:self.champs);self.engine.start()
         self.afk=AntiAfk(self.cfg,self._log,self.engine);self.afk.start()
     def _load(self):
         self._log("[SUCCESS] Initialising Hextech Draft v3...")
@@ -1294,6 +1683,8 @@ class Api:
             "enemies":self.engine.cs_enemies if self.engine else [],
             "bans":self.engine.cs_bans if self.engine else [],
             "pause_pick":self.engine.pause_pick if self.engine else False,
+            "smart_pick":self.engine.smart_pick_suggestion if self.engine else None,
+            "smart_pick_alts":self.engine.smart_pick_alternatives if self.engine else [],
             "logs":self.logs[-12:]
         })
     def get_config(self,role): return json.dumps(self.cfg.snap(role))
@@ -1349,6 +1740,8 @@ class Api:
         elif key=='chat_msg':self.cfg.chat_msg=value
         elif key=='region':self.cfg.region=str(value).lower()
         elif key=='build_source':self.cfg.build_source=str(value).lower()
+        elif key=='smart_pick_pool':
+            if str(value).lower() in ('favorites','all'):self.cfg.smart_pick_pool=str(value).lower()
         elif key=='afk_threshold':
             try:self.cfg.afk_threshold=max(5,min(120,int(value)))
             except:pass
@@ -1360,6 +1753,36 @@ class Api:
         return self.cfg.region or 'eune'
     def get_build_source(self):
         return self.cfg.build_source or ''
+    def set_favorite_tag(self,champ_id,role,bucket):
+        """Override Smart Pick's comp-synergy bucket for one champion IN ONE ROLE —
+        keyed by champ+role, not just champ, since the same champion can mean a
+        different build (and a different comp slot) in different roles — e.g. AP
+        Nunu mid vs tank Nunu jungle shouldn't share one override.
+        bucket='auto' clears the override back to ddragon's own tags."""
+        valid=set(_TAG_GROUP.values())
+        key=f"{champ_id}_{role}"
+        if bucket=='auto':
+            self.cfg.favorite_tags.pop(key,None)
+        elif bucket in valid:
+            self.cfg.favorite_tags[key]=bucket
+        else:
+            return False
+        self.cfg.save()
+        return True
+    def set_build_style(self,champ_id,role,style):
+        """Per-champion-per-role build-style preference (one of _BUILD_STYLES, or
+        'auto') — a player who goes AP in one role and tank in another on the same
+        champion just sets each role separately; no API key or AI call needed, the
+        free item-tag heuristic in pick_items_by_style() honors it."""
+        key=f"{champ_id}_{role}"
+        if style=='auto':
+            self.cfg.build_style_tags.pop(key,None)
+        elif style in _BUILD_STYLES:
+            self.cfg.build_style_tags[key]=style
+        else:
+            return False
+        self.cfg.save()
+        return True
     def toggle_pause_pick(self):
         if self.engine:
             self.engine.pause_pick=not self.engine.pause_pick
@@ -1411,6 +1834,38 @@ class Api:
 
     def get_favorites(self):
         return json.dumps(self.cfg.favorites or [])
+
+    def set_role_favorite(self, champ_id, role, on):
+        """Per-role favorite — same champion can be favorited for one lane and not
+        another (e.g. Nunu favorited for Jungle but not Mid)."""
+        cid=int(champ_id)
+        lst=self.cfg.favorites_by_role.setdefault(role,[])
+        if on and cid not in lst:lst.append(cid)
+        elif not on and cid in lst:lst.remove(cid)
+        self.cfg.save()
+        return json.dumps(lst)
+
+    def get_role_pool(self, role):
+        """Champions commonly played in a role (op.gg+Blitz ensemble), for the
+        champion-grid's lane filter tabs — same data Smart Pick's 'all' pool uses."""
+        try:
+            return json.dumps([e['name'] for e in _ensemble_role_pool(role,log=self._log)])
+        except Exception as e:
+            self._log(f"[DEBUG] get_role_pool error: {e}")
+            return json.dumps([])
+
+    def get_owned_champions(self):
+        """Champion IDs owned on this account, for splitting the grid into an
+        owned/unowned section. Empty list (not None) when not connected or the
+        LCU call fails — JS treats that the same as 'no ownership data yet'."""
+        if self.engine and self.engine.session:
+            try:
+                d=api_get(self.engine.session,"/lol-champions/v1/owned-champions-minimal")
+                if isinstance(d,list):
+                    return json.dumps([c['id'] for c in d if c.get('id')])
+            except Exception as e:
+                self._log(f"[DEBUG] get_owned_champions error: {e}")
+        return json.dumps([])
 
     def get_mastery(self, champ_id):
         if self.engine and self.engine.session:
@@ -1661,7 +2116,7 @@ body{background:var(--bg);color:var(--text);font-family:'Rajdhani',sans-serif;fo
 .sh .bd{font-family:'JetBrains Mono';font-size:9px;color:var(--text2);font-weight:600}
 
 /* LEFT PANEL */
-.tp{display:flex;flex-direction:column;padding:8px;overflow-y:auto}
+.tp{display:flex;flex-direction:column;padding:8px;overflow-y:auto;overflow-x:hidden}
 .slot{display:flex;align-items:center;gap:7px;padding:5px 7px;border:1px solid transparent;border-radius:6px;cursor:pointer;transition:all .2s;margin-bottom:2px}
 .slot:hover{background:var(--surfhov);border-color:var(--border)}
 .slot.on{border-color:var(--bordercyan);background:rgba(10,200,185,.06)}
@@ -1678,7 +2133,7 @@ body{background:var(--bg);color:var(--text);font-family:'Rajdhani',sans-serif;fo
 .bs img{width:100%;height:100%;object-fit:cover}
 .bs-label{position:absolute;bottom:0;left:0;right:0;font-family:'Orbitron';font-size:6px;font-weight:700;text-align:center;background:rgba(0,0,0,.7);color:var(--textm);padding:1px;letter-spacing:1px}
 .srow{display:flex;gap:4px;margin-top:3px}
-.ss{width:32px;height:32px;border-radius:4px;border:1px solid var(--border);background:rgba(1,10,19,.5);cursor:pointer;overflow:hidden;transition:all .2s}
+.ss{width:32px;height:32px;border-radius:4px;border:1px solid var(--border);background:rgba(1,10,19,.5);cursor:pointer;overflow:hidden;transition:all .2s;padding:0;appearance:none;-webkit-appearance:none;font:inherit}
 .ss:hover{border-color:var(--bordercyan)}.ss img{width:100%;height:100%;object-fit:cover}
 .rs{display:flex;align-items:center;gap:6px;padding:4px 7px;border:1px solid var(--border);border-radius:4px;cursor:pointer;margin-top:3px;font-family:'Rajdhani';font-size:12px;font-weight:600;color:var(--text2);transition:all .2s;letter-spacing:.5px}
 .rs:hover{border-color:var(--bordercyan);color:var(--text)}
@@ -1702,8 +2157,11 @@ body{background:var(--bg);color:var(--text);font-family:'Rajdhani',sans-serif;fo
 .tgs{display:flex;gap:3px;flex-wrap:wrap;margin-bottom:5px}
 .tg{padding:3px 10px;font-family:'Orbitron';font-size:7px;font-weight:700;letter-spacing:1px;cursor:pointer;border:1px solid var(--border);border-radius:20px;color:var(--textm);transition:all .2s}
 .tg:hover{border-color:rgba(200,170,110,.4);color:var(--text2)}.tg.on{color:var(--gold);border-color:var(--borderact);background:rgba(200,170,110,.08)}
-.cg{flex:1;overflow-y:auto;display:grid;grid-template-columns:repeat(auto-fill,minmax(74px,1fr));gap:3px;align-content:flex-start;padding-right:3px}
-.ch{text-align:center;cursor:pointer;padding:3px;border:1px solid transparent;border-radius:6px;transition:all .15s}
+.cg{flex:1;overflow-y:auto;overflow-x:hidden;display:grid;grid-template-columns:repeat(auto-fill,minmax(74px,1fr));gap:3px;align-content:flex-start;padding-right:3px}
+.ch{text-align:center;cursor:pointer;padding:3px;border:1px solid transparent;border-radius:6px;transition:all .15s;appearance:none;-webkit-appearance:none;background:none;font:inherit;color:inherit;display:block;width:100%}
+.sw{appearance:none;-webkit-appearance:none;padding:0;font:inherit;color:inherit}
+.favstar{appearance:none;-webkit-appearance:none;font:inherit;padding:0;border:none}
+.iconx{appearance:none;-webkit-appearance:none;font:inherit;padding:0;border:none;background:transparent}
 .ch:hover{border-color:var(--bordercyan);background:rgba(10,200,185,.04);transform:translateY(-1px)}
 .ch.sel{border-color:var(--cyan);background:rgba(10,200,185,.08)}
 .ch img{width:56px;height:56px;border-radius:4px;border:2px solid rgba(200,170,110,.12);display:block;margin:0 auto 2px;transition:all .2s}
@@ -1713,7 +2171,7 @@ body{background:var(--bg);color:var(--text);font-family:'Rajdhani',sans-serif;fo
 .nr{grid-column:1/-1;text-align:center;padding:30px;font-family:'Orbitron';font-size:10px;color:var(--textm);letter-spacing:3px}
 
 /* RIGHT: PREFS */
-.rp{display:flex;flex-direction:column;padding:8px;overflow-y:auto}
+.rp{display:flex;flex-direction:column;padding:8px;overflow-y:auto;overflow-x:hidden}
 .prof{display:flex;align-items:center;gap:10px;padding:10px;background:rgba(1,10,19,.4);border-radius:6px;margin-bottom:6px}
 .pav{width:42px;height:42px;border-radius:50%;border:2px solid var(--gold);background:var(--panel);display:flex;align-items:center;justify-content:center;font-family:'Orbitron';font-size:16px;font-weight:900;color:var(--gold)}
 .pinf .pnm{font-family:'Rajdhani';font-size:16px;font-weight:700;color:var(--text);text-transform:uppercase;letter-spacing:1px}
@@ -1734,7 +2192,7 @@ body{background:var(--bg);color:var(--text);font-family:'Rajdhani',sans-serif;fo
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
 .conh .lv{color:var(--cyan);display:flex;align-items:center;gap:4px;font-family:'JetBrains Mono';font-size:9px}.conh .lv::before{content:'';width:5px;height:5px;border-radius:50%;background:var(--cyan);box-shadow:0 0 6px var(--cyan);animation:pulse 2s infinite}
 .conb{display:flex;gap:12px;padding:3px 12px;font-size:11px;font-weight:600}.conb .cc{color:var(--cyan)}.conb .cp{color:var(--textm)}.conb .ca{color:var(--textm);margin-left:auto}
-.la{background:rgba(1,10,19,.8);margin:3px 5px 5px;padding:5px 8px;border-radius:4px;font-family:'JetBrains Mono';font-size:10px;height:70px;overflow-y:auto;border:1px solid var(--bordercyan)}
+.la{background:rgba(1,10,19,.8);margin:3px 5px 5px;padding:5px 8px;border-radius:4px;font-family:'JetBrains Mono';font-size:10px;height:70px;overflow-y:auto;overflow-x:hidden;border:1px solid var(--bordercyan)}
 .ll{margin-bottom:1px;line-height:1.5;display:flex;gap:6px}.ll .ts{color:rgba(10,200,185,.35);flex-shrink:0}.ll .ok{color:var(--success);font-weight:600}.ll .nf{color:var(--textm)}.ll .db{color:var(--gold)}
 
 /* MODAL */
@@ -1743,7 +2201,7 @@ body{background:var(--bg);color:var(--text);font-family:'Rajdhani',sans-serif;fo
 .mh{padding:8px 14px;font-family:'Orbitron';font-size:9px;font-weight:700;letter-spacing:2px;color:var(--gold);display:flex;justify-content:space-between;align-items:center}
 .mh button{background:none;border:none;color:var(--textm);cursor:pointer;font-size:14px}.mh button:hover{color:var(--danger)}
 .msr{padding:5px 8px}.msr input{width:100%;background:rgba(1,10,19,.7);border:1px solid var(--border);border-radius:4px;color:var(--text);padding:7px 10px;font-size:12px;outline:none;font-family:'Rajdhani';font-weight:600}.msr input:focus{border-color:var(--bordercyan)}
-.mls{flex:1;overflow-y:auto;padding:4px 8px}
+.mls{flex:1;overflow-y:auto;overflow-x:hidden;padding:4px 8px}
 .mi{display:flex;align-items:center;gap:8px;padding:7px 10px;cursor:pointer;border-radius:6px;transition:all .15s}.mi:hover{background:rgba(10,200,185,.06)}
 .mi img{width:32px;height:32px;border-radius:4px;border:1px solid var(--border)}.mi .mn{font-family:'Rajdhani';font-size:13px;font-weight:700;color:var(--text);letter-spacing:.5px}
 .mi .src{font-family:'Orbitron';font-size:7px;color:var(--cyan);margin-left:auto;letter-spacing:1px;font-weight:700}
@@ -1759,7 +2217,7 @@ body{background:var(--bg);color:var(--text);font-family:'Rajdhani',sans-serif;fo
 .settings-box{border-radius:10px;width:400px;max-height:500px;display:flex;flex-direction:column;overflow:hidden;box-shadow:0 16px 50px rgba(0,0,0,.5)}
 .settings-box .sh2{padding:10px 16px;font-family:'Orbitron';font-size:10px;font-weight:700;letter-spacing:3px;color:var(--gold);display:flex;justify-content:space-between;align-items:center}
 .settings-box .sh2 button{background:none;border:none;color:var(--textm);cursor:pointer;font-size:16px}.settings-box .sh2 button:hover{color:var(--danger)}
-.settings-body{padding:10px 14px;overflow-y:auto}
+.settings-body{padding:10px 14px;overflow-y:auto;overflow-x:hidden}
 .scat{font-family:'Orbitron';font-size:8px;font-weight:700;letter-spacing:3px;color:var(--textm);margin:10px 0 6px;padding-bottom:4px;border-bottom:1px solid rgba(200,170,110,.1)}
 .scat:first-child{margin-top:0}
 .srow{display:flex;align-items:center;gap:8px;padding:8px 6px;border-radius:6px;transition:background .2s}.srow:hover{background:rgba(1,10,19,.4)}
@@ -1833,7 +2291,8 @@ body.lite .dot.on{box-shadow:none}
 <div class="gp" style="padding:0"><div class="gc tl"></div><div class="gc tr"></div><div class="gc bl"></div><div class="gc br"></div><div class="scanl"></div>
 <div class="hdr"><div class="hdr-l"><div class="sub">SESSION · RANKED · v"""+APP_VERSION+r"""</div><h1 class="gshim">HEXTECH DRAFT</h1></div>
 <div id="updateBanner" style="display:none;padding:4px 12px;border:1px solid var(--success);border-radius:4px;background:rgba(0,255,156,.06);font-family:JetBrains Mono;font-size:9px;color:var(--success);cursor:pointer;font-weight:600" onclick="doUpdate()">⬆ UPDATE AVAILABLE</div>
-<div class="hdr-st"><div class="dot" id="dot"></div><span id="sn">Searching...</span></div>
+<div class="hdr-st"><div class="dot" id="dot"></div><span id="sn">Searching...</span>
+<button id="resumeBtn" style="display:none;margin-left:8px;padding:3px 10px;font-family:Orbitron;font-size:9px;font-weight:700;letter-spacing:1px;border:1px solid var(--cyan);border-radius:4px;color:var(--cyan);background:rgba(10,200,185,.08);cursor:pointer" onclick="togglePause()">▶ RESUME AUTO-LOCK</button></div>
 <div class="zc"><button class="zb" onclick="zO()">−</button><span class="zp" id="zp">100%</span><button class="zb" onclick="zI()">+</button></div>
 <button class="gear-btn" onclick="openSettings()">⚙</button>
 </div></div>
@@ -1848,6 +2307,13 @@ body.lite .dot.on{box-shadow:none}
 <div id="liveEnemies" style="display:flex;gap:3px;flex-wrap:wrap;margin-bottom:4px"></div>
 <div class="sh"><h3>ALL BANS</h3></div>
 <div id="liveBans" style="display:flex;gap:3px;flex-wrap:wrap;margin-bottom:4px"></div>
+<div id="smartPickBox" style="display:none;margin-top:6px;padding:6px 8px;border:1px solid var(--bordercyan);border-radius:6px;background:rgba(10,200,185,.05)">
+<div style="font-size:9px;letter-spacing:1px;color:var(--cyan);margin-bottom:4px">🧠 SMART PICK</div>
+<div style="display:flex;align-items:center;gap:6px">
+<img id="spImg" alt="" style="width:28px;height:28px;border-radius:4px;border:1px solid var(--bordercyan)" src="">
+<div style="min-width:0"><div id="spName" style="font-size:12px;font-weight:700;letter-spacing:.5px"></div>
+<div id="spReasons" style="font-size:9px;color:var(--textm);white-space:nowrap;overflow:hidden;text-overflow:ellipsis"></div></div>
+</div></div>
 <div class="hdiv"></div>
 </div>
 <div class="sh"><h3>BAN / BACKUP</h3><span class="bd" id="bc">0/1</span></div>
@@ -1867,16 +2333,19 @@ body.lite .dot.on{box-shadow:none}
 <button class="lkb backup" onclick="doQBk()">✦ BACKUP</button>
 <button class="lkb pick" onclick="doQP()">✦ PICK</button>
 <button class="lkb pick" onclick="doRandom()" style="border-color:rgba(200,170,110,.3);color:var(--gold)">🎲 FAV</button>
-<button class="lkb pick" onclick="doRandomAll()" style="border-color:rgba(10,200,185,.2);color:var(--textm)">🎲 ALL</button></div>
+<button class="lkb pick" onclick="doRandomAll()" style="border-color:rgba(10,200,185,.2);color:var(--textm)">🎲 ALL</button>
+<button class="lkb pick" onclick="doSmartPick()" style="border-color:rgba(10,200,185,.4);color:var(--cyan)">🧠 ALL LANES</button></div>
 <div style="font-family:JetBrains Mono;font-size:8px;color:var(--textm);padding:0 0 4px;letter-spacing:1px">SHORTCUTS: [P] Pick · [B] Ban · [K] Backup · [R] Random · [ESC] Close · DOUBLE-CLICK to pick</div>
 <div id="selInfo" style="display:none;padding:6px 10px;margin-bottom:6px;border:1px solid var(--border);border-radius:6px;background:rgba(1,10,19,.4);align-items:center;gap:8px">
-<img id="selImg" style="width:32px;height:32px;border-radius:4px;border:1px solid var(--bordercyan)" src="">
+<img id="selImg" alt="" style="width:32px;height:32px;border-radius:4px;border:1px solid var(--bordercyan)" src="">
 <span id="selName" style="font-size:14px;font-weight:700;letter-spacing:1px;text-transform:uppercase"></span>
 <span id="selTags" style="font-size:9px;color:var(--textm);font-family:JetBrains Mono"></span>
 <span id="selWR" style="font-size:10px;font-family:JetBrains Mono;font-weight:600;margin-left:4px"></span>
 <button class="hb" style="margin-left:auto" onclick="openOpgg()">OP.GG</button>
 <button class="hb" onclick="openUgg()">U.GG</button>
 <button class="hb" onclick="openCounters()">⚔ COUNTERS</button>
+<button class="hb" onclick="setCompRole()">🏷 ROLE</button>
+<button class="hb" onclick="setBuildStyle()">🧪 BUILD</button>
 <button class="hb" onclick="editNote()">📝</button>
 </div>
 <div id="selNote" style="display:none;padding:4px 10px;margin-bottom:6px;font-size:10px;color:var(--gold);font-style:italic;border-left:2px solid var(--gold);margin-left:10px"></div>
@@ -1889,7 +2358,7 @@ body.lite .dot.on{box-shadow:none}
 <div id="queueBar" style="display:none;padding:5px 8px;margin-bottom:6px;border:1px solid var(--bordercyan);border-radius:4px;background:rgba(10,200,185,.05);font-family:JetBrains Mono;font-size:10px;color:var(--cyan);text-align:center;letter-spacing:2px"></div>
 <div class="sh"><h3>PREFERENCES</h3><span class="bd" id="pbdg">0/3 ON</span></div><div class="hdiv"></div><div id="pl"></div><div class="hdiv"></div>
 <div class="sh"><h3>MATCH HISTORY</h3><span class="bd" style="cursor:pointer;color:var(--cyan)" onclick="loadHist()">↻</span></div>
-<div id="histBox" style="max-height:110px;overflow-y:auto;margin-bottom:4px" class="hs"></div>
+<div id="histBox" style="max-height:110px;overflow-y:auto;overflow-x:hidden;margin-bottom:4px" class="hs"></div>
 <div style="display:flex;gap:4px;margin-bottom:4px">
 <button class="hb" style="flex:1;text-align:center;padding:5px 4px" onclick="copyRole()">📋 COPY ROLE</button>
 <button class="hb" style="flex:1;text-align:center;padding:5px 4px" onclick="showBans()">🛡 BAN SUGGEST</button>
@@ -1913,19 +2382,19 @@ body.lite .dot.on{box-shadow:none}
 <div id="pickPopup" style="display:none;position:fixed;inset:0;background:rgba(1,10,19,.8);backdrop-filter:blur(4px);z-index:250;justify-content:center;align-items:center;transform:scale(var(--zoom));transform-origin:center center">
 <div style="background:rgba(9,20,40,.95);border:1px solid var(--bordercyan);border-radius:12px;padding:20px 28px;width:320px;text-align:center;box-shadow:0 0 30px rgba(10,200,185,.15)">
 <div style="font-family:Orbitron;font-size:10px;color:var(--textm);letter-spacing:3px;margin-bottom:8px">YOUR TURN TO PICK</div>
-<img id="ppImg" style="width:64px;height:64px;border-radius:8px;border:2px solid var(--cyan);margin-bottom:8px" src="">
+<img id="ppImg" alt="" style="width:64px;height:64px;border-radius:8px;border:2px solid var(--cyan);margin-bottom:8px" src="">
 <div id="ppName" style="font-family:Rajdhani;font-size:18px;font-weight:700;color:var(--text);text-transform:uppercase;letter-spacing:1px;margin-bottom:4px"></div>
 <div id="ppTimer" style="font-family:Orbitron;font-size:24px;font-weight:900;color:var(--cyan);margin-bottom:12px;letter-spacing:4px"></div>
 <button onclick="pauseAndPickManually()" style="width:100%;padding:10px;font-family:Orbitron;font-size:10px;font-weight:700;letter-spacing:2px;border:1px solid var(--danger);border-radius:6px;color:var(--danger);background:rgba(255,78,80,.06);cursor:pointer;transition:all .15s" onmouseover="this.style.background='rgba(255,78,80,.15)'" onmouseout="this.style.background='rgba(255,78,80,.06)'" onmousedown="this.style.transform='scale(0.95)'" onmouseup="this.style.transform='scale(1)'">⏸ PICK MANUALLY</button>
 </div></div>
 <div class="mbg" id="mbg"><div class="gp mdl"><div class="gc tl"></div><div class="gc tr"></div><div class="gc bl"></div><div class="gc br"></div>
-<div class="mh"><span id="mt">SELECT</span><button onclick="clM()">✕</button></div>
+<div class="mh"><span id="mt">SELECT</span><button type="button" aria-label="Close" onclick="clM()">✕</button></div>
 <div class="msr"><input id="ms" placeholder="Search..." oninput="fM()"></div>
 <div class="mls hs" id="ml"></div></div></div>
 <script>
 var cR='TOP',ddV='14.10.1',aT='ALL',sM=null,selC=null,aC=[],aS=[],cMap={},runeMap={},styleMap={},curZoom=100,runeTarget='rune',curRegion='eune';
 var RS=['TOP','JUNGLE','MIDDLE','BOTTOM','UTILITY'],RN={TOP:'TOP',JUNGLE:'JNG',MIDDLE:'MID',BOTTOM:'ADC',UTILITY:'SUP'};
-var TGS=['ALL','Favorites','Recent','Fighter','Tank','Mage','Assassin','Marksman','Support'];
+var TGS=['ALL','Favorites','Recent'].concat(RS);
 var PX='data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
 function cI(i){return i?'https://ddragon.leagueoflegends.com/cdn/'+ddV+'/img/champion/'+i+'.png':'';}
 function sI(i){return i?'https://ddragon.leagueoflegends.com/cdn/'+ddV+'/img/spell/'+i+'.png':'';}
@@ -1933,11 +2402,28 @@ function pI(id){var p=runeMap[String(id)];return p?p.icon:'';}
 function zI(){curZoom=Math.min(150,curZoom+10);aZ()}
 function zO(){curZoom=Math.max(60,curZoom-10);aZ()}
 function aZ(){document.documentElement.style.setProperty('--zoom',curZoom/100);document.getElementById('zp').textContent=curZoom+'%'}
+async function callApiRetry(fn,retries,delayMs){
+// window.pywebview.api existing does NOT mean every individual method is bound
+// yet — a method called right after the bridge first appears can still throw.
+// Retry instead of giving up after one attempt, so a slow-to-bind method
+// (whichever one it happens to be) doesn't silently leave the champion grid,
+// rune data, or locked-pick display stuck empty for the whole session.
+for(var i=0;i<=retries;i++){
+try{return await fn()}catch(e){if(i===retries)throw e;await new Promise(function(r){setTimeout(r,delayMs)})}
+}}
 async function init(){
-try{ddV=await pywebview.api.get_ddragon_ver()}catch(e){}
-try{aC=JSON.parse(await pywebview.api.get_champions());aS=JSON.parse(await pywebview.api.get_spells());aC.forEach(function(c){cMap[c.id]=c})}catch(e){}
-try{var rd=JSON.parse(await pywebview.api.get_rune_data());if(rd.perks)Object.keys(rd.perks).forEach(function(k){runeMap[k]=rd.perks[k]});if(rd.styles)Object.keys(rd.styles).forEach(function(k){styleMap[k]=rd.styles[k]})}catch(e){}
-rTB();rT();rSp();rRn();rP();loadFavs().then(function(){loadRecent().then(function(){rG()})});loadTheme();loadRegion();setInterval(poll,300);
+try{ddV=await callApiRetry(function(){return pywebview.api.get_ddragon_ver()},30,200)}catch(e){}
+try{
+var champsP=callApiRetry(function(){return pywebview.api.get_champions()},30,200);
+var spellsP=callApiRetry(function(){return pywebview.api.get_spells()},30,200);
+aC=JSON.parse(await champsP);aS=JSON.parse(await spellsP);aC.forEach(function(c){cMap[c.id]=c})
+}catch(e){}
+try{var rd=JSON.parse(await callApiRetry(function(){return pywebview.api.get_rune_data()},30,200));if(rd.perks)Object.keys(rd.perks).forEach(function(k){runeMap[k]=rd.perks[k]});if(rd.styles)Object.keys(rd.styles).forEach(function(k){styleMap[k]=rd.styles[k]})}catch(e){}
+rTB();rT();rSp();rRn();rP();loadFavs().then(function(){loadFavsByRole().then(function(){loadRecent().then(function(){rG()})})});loadTheme();loadRegion();setInterval(poll,300);
+// Warm the lane-pool cache for all 5 roles in the background so the first click on
+// a lane tab is instant instead of waiting on op.gg/Blitz — sequential, not Promise.all,
+// so this doesn't compete with anything the user is actively doing for bandwidth.
+(async function(){for(var pfi=0;pfi<RS.length;pfi++){await loadRolePool(RS[pfi])}})();
 // Auto-check for updates on startup (silent)
 setTimeout(async function(){try{
 var r=JSON.parse(await pywebview.api.check_update());
@@ -1954,7 +2440,8 @@ if(!src){showSourcePicker()}
 function showSourcePicker(){
 var box=document.createElement('div');
 box.style.cssText='position:fixed;inset:0;background:rgba(1,10,19,.9);backdrop-filter:blur(8px);z-index:500;display:flex;justify-content:center;align-items:center';
-box.innerHTML='<div style="background:rgba(9,20,40,.9);border:1px solid var(--border);border-radius:12px;padding:24px;width:380px;text-align:center;box-shadow:0 16px 50px rgba(0,0,0,.5)">'+
+box.innerHTML='<div style="background:rgba(9,20,40,.9);border:1px solid var(--border);border-radius:12px;padding:24px;width:380px;text-align:center;box-shadow:0 16px 50px rgba(0,0,0,.5);position:relative">'+
+'<button id="srcClose" aria-label="Skip, use U.GG for now" style="position:absolute;top:10px;right:10px;width:24px;height:24px;border:1px solid var(--border);border-radius:6px;background:transparent;color:var(--textm);cursor:pointer;font-size:12px;line-height:1">✕</button>'+
 '<div style="font-family:Orbitron;font-size:14px;font-weight:700;color:var(--gold);margin-bottom:4px;letter-spacing:2px">WELCOME TO HEXTECH DRAFT</div>'+
 '<div style="font-size:11px;color:var(--textm);margin-bottom:4px">Runes are always fetched from U.GG</div>'+
 '<div style="font-size:11px;color:var(--text2);margin-bottom:16px">Choose where to get item builds from. You can change this anytime in Settings.</div>'+
@@ -1966,6 +2453,14 @@ var sources=[
 {id:'lolalytics',name:'Lolalytics',desc:'High sample size stats',color:'var(--success)'}
 ];
 var btns=box.querySelector('#srcBtns');
+function dismiss(choiceId){
+document.removeEventListener('keydown',onEsc);
+box.remove();
+if(choiceId)pywebview.api.set_global('build_source',choiceId).catch(function(){});
+}
+function onEsc(e){if(e.key==='Escape')dismiss('ugg')}
+document.addEventListener('keydown',onEsc);
+box.querySelector('#srcClose').onclick=function(){dismiss('ugg');toast('🛒 Item source: U.GG (default)','info')};
 sources.forEach(function(s){
 var b=document.createElement('div');
 b.style.cssText='padding:12px 16px;border:1px solid '+s.color+';border-radius:8px;cursor:pointer;transition:all .15s;text-align:left';
@@ -1974,10 +2469,65 @@ b.onmouseover=function(){b.style.background='rgba(10,200,185,.08)'};
 b.onmouseout=function(){b.style.background='transparent'};
 b.onmousedown=function(){b.style.transform='scale(0.97)'};
 b.onmouseup=function(){b.style.transform='scale(1)'};
-b.onclick=async function(){
-try{await pywebview.api.set_global('build_source',s.id)}catch(e){}
-box.remove();toast('🛒 Item source: '+s.name,'success')};
+b.onclick=function(){dismiss(s.id);toast('🛒 Item source: '+s.name,'success')};
 btns.appendChild(b)})}
+function dlg(opts){
+return new Promise(function(resolve){
+var box=document.createElement('div');
+box.style.cssText='position:fixed;inset:0;background:rgba(1,10,19,.85);backdrop-filter:blur(6px);z-index:600;display:flex;justify-content:center;align-items:center';
+var bodyHtml='';
+if(opts.type==='prompt'){
+bodyHtml='<input id="dlgInput" style="width:100%;box-sizing:border-box;background:rgba(1,10,19,.6);border:1px solid var(--border);border-radius:6px;padding:8px 10px;color:var(--text);font-family:\'JetBrains Mono\',monospace;font-size:12px;margin-top:10px" placeholder="'+(opts.placeholder||'')+'">';
+}else if(opts.type==='choice'){
+bodyHtml='<div id="dlgChoices" style="display:flex;flex-direction:column;gap:8px;margin-top:12px"></div>';
+}
+var btnHtml='';
+if(opts.type==='alert'){
+btnHtml='<button id="dlgOk" style="flex:1;padding:10px;font-family:Orbitron;font-size:10px;font-weight:700;letter-spacing:1px;border:1px solid var(--cyan);border-radius:6px;color:var(--cyan);background:rgba(10,200,185,.08);cursor:pointer">OK</button>';
+}else if(opts.type==='choice'){
+btnHtml='<button id="dlgCancel" style="width:100%;padding:8px;font-family:Orbitron;font-size:9px;letter-spacing:1px;border:1px solid var(--border);border-radius:6px;color:var(--textm);background:transparent;cursor:pointer;margin-top:4px">CANCEL</button>';
+}else{
+btnHtml='<button id="dlgCancel" style="flex:1;padding:10px;font-family:Orbitron;font-size:10px;font-weight:700;letter-spacing:1px;border:1px solid var(--border);border-radius:6px;color:var(--textm);background:transparent;cursor:pointer">CANCEL</button>'+
+'<button id="dlgConfirm" style="flex:1;padding:10px;font-family:Orbitron;font-size:10px;font-weight:700;letter-spacing:1px;border:1px solid '+(opts.danger?'var(--danger)':'var(--cyan)')+';border-radius:6px;color:'+(opts.danger?'var(--danger)':'var(--cyan)')+';background:'+(opts.danger?'rgba(255,70,85,.08)':'rgba(10,200,185,.08)')+';cursor:pointer">'+(opts.confirmLabel||'CONFIRM')+'</button>';
+}
+box.innerHTML='<div style="background:rgba(9,20,40,.95);border:1px solid var(--border);border-radius:12px;padding:22px;width:380px;box-shadow:0 16px 50px rgba(0,0,0,.5)">'+
+'<div style="font-family:Orbitron;font-size:13px;font-weight:700;color:var(--gold);letter-spacing:1.5px;margin-bottom:6px">'+opts.title+'</div>'+
+(opts.message?'<div style="font-size:11px;color:var(--text2);line-height:1.5">'+opts.message+'</div>':'')+
+bodyHtml+
+'<div style="display:flex;gap:8px;margin-top:16px">'+btnHtml+'</div></div>';
+document.body.appendChild(box);
+function close(val){box.remove();document.removeEventListener('keydown',onKey);resolve(val)}
+function onKey(e){if(e.key==='Escape')close(opts.type==='prompt'||opts.type==='choice'?null:false)}
+document.addEventListener('keydown',onKey);
+if(opts.type==='choice'){
+var cc=box.querySelector('#dlgChoices');
+(opts.options||[]).forEach(function(o){
+var b=document.createElement('div');
+b.style.cssText='padding:10px 14px;border:1px solid '+(o.color||'var(--border)')+';border-radius:8px;cursor:pointer;transition:background .15s;text-align:left';
+b.innerHTML='<div style="font-family:Orbitron;font-size:11px;font-weight:700;color:'+(o.color||'var(--cyan)')+';letter-spacing:1px">'+o.label+'</div>'+(o.desc?'<div style="font-size:10px;color:var(--textm);margin-top:2px">'+o.desc+'</div>':'');
+b.onmouseover=function(){b.style.background='rgba(10,200,185,.08)'};
+b.onmouseout=function(){b.style.background='transparent'};
+b.onclick=function(){close(o.value)};
+cc.appendChild(b)});
+var cb=box.querySelector('#dlgCancel');if(cb)cb.onclick=function(){close(null)};
+}else if(opts.type==='alert'){
+box.querySelector('#dlgOk').onclick=function(){close(true)};
+}else{
+box.querySelector('#dlgCancel').onclick=function(){close(opts.type==='prompt'?null:false)};
+box.querySelector('#dlgConfirm').onclick=function(){
+if(opts.type==='prompt'){close(box.querySelector('#dlgInput').value)}
+else{close(true)}
+};
+if(opts.type==='prompt'){
+var inp=box.querySelector('#dlgInput');inp.value=opts.defaultValue||'';inp.focus();inp.select();
+inp.addEventListener('keydown',function(e){if(e.key==='Enter')box.querySelector('#dlgConfirm').click()});
+}
+}
+})}
+function dlgConfirm(title,message,opts){opts=opts||{};return dlg({type:'confirm',title:title,message:message,confirmLabel:opts.confirmLabel,danger:opts.danger})}
+function dlgPrompt(title,message,defaultValue,placeholder){return dlg({type:'prompt',title:title,message:message,defaultValue:defaultValue,placeholder:placeholder})}
+function dlgChoice(title,message,options){return dlg({type:'choice',title:title,message:message,options:options})}
+function dlgAlert(title,message){return dlg({type:'alert',title:title,message:message})}
 async function loadTheme(){try{var cfg=JSON.parse(await pywebview.api.get_config('TOP'));
 if(cfg.light_mode)document.body.classList.add('light');
 if(cfg.lite_mode)document.body.classList.add('lite')}catch(e){}}
@@ -1991,9 +2541,20 @@ var pool=aC.filter(function(c){return c.tags&&c.tags.some(function(t){return tag
 if(!pool.length)pool=aC;
 var c=pool[Math.floor(Math.random()*pool.length)];
 selC=c;asgn('pick',c);toast('🎲 Random: '+c.name,'info')}
-async function copyRole(){var from=cR;var to=prompt('Copy '+cR+' config to which role? (TOP/JUNGLE/MIDDLE/BOTTOM/UTILITY)');
+async function doSmartPick(){
+// Global — arms Smart Pick for every lane at once (sets each role's Pick to
+// the SMART sentinel). To arm just one lane instead, click the 🧠 Smart Pick
+// tile at the top of the champion grid while that role is selected.
+try{
+for(var ri=0;ri<RS.length;ri++){
+await pywebview.api.set_setting(RS[ri],'pick_id','SMART');
+await pywebview.api.set_setting(RS[ri],'pick_name','Smart Pick');
+await pywebview.api.set_setting(RS[ri],'pick_img','__null__')}
+toast('🧠 Smart Pick ARMED for every lane','success');rT();rG()
+}catch(e){toast('Smart Pick failed','warn')}}
+async function copyRole(){var from=cR;var to=await dlgPrompt('Copy Role Config','Copy '+cR+' config to which role?','','TOP / JUNGLE / MIDDLE / BOTTOM / UTILITY');
 if(to&&['TOP','JUNGLE','MIDDLE','BOTTOM','UTILITY'].indexOf(to.toUpperCase())>=0){
-try{await pywebview.api.copy_role(from,to.toUpperCase());rT()}catch(e){}}}
+try{await pywebview.api.copy_role(from,to.toUpperCase());rT();toast('Copied '+cR+' → '+to.toUpperCase(),'success')}catch(e){toast('Copy role failed','warn')}}}
 async function loadHist(){
 var box=document.getElementById('histBox');box.innerHTML='<div style="color:var(--textm);font-size:9px;padding:4px">Loading...</div>';
 try{var games=JSON.parse(await pywebview.api.get_match_history());
@@ -2005,7 +2566,7 @@ var kda=g.kills+'/'+g.deaths+'/'+g.assists;
 var min=Math.floor(g.duration/60);
 var row=document.createElement('div');
 row.style.cssText='display:flex;align-items:center;gap:6px;padding:3px 6px;border-radius:4px;margin-bottom:2px;background:'+(g.win?'rgba(0,255,156,.06)':'rgba(255,78,80,.06)')+';border-left:2px solid '+(g.win?'var(--success)':'var(--danger)');
-row.innerHTML=(img?'<img src="'+img+'" style="width:24px;height:24px;border-radius:3px">':'')+
+row.innerHTML=(img?'<img src="'+img+'" alt="" style="width:24px;height:24px;border-radius:3px">':'')+
 '<span style="font-size:10px;font-weight:600;color:var(--text);width:55px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+name+'</span>'+
 '<span style="font-size:10px;font-family:JetBrains Mono;color:'+(g.win?'var(--success)':'var(--danger)')+'">'+kda+'</span>'+
 '<span style="font-size:8px;color:var(--textm);margin-left:auto">'+min+'m</span>';
@@ -2015,7 +2576,7 @@ var names=JSON.parse(await pywebview.api.lookup_team());
 if(names.length){
 var q=names.join(',');
 window.open('https://www.op.gg/multisearch/'+curRegion+'?summoners='+encodeURIComponent(q),'_blank')}
-else{alert('Not in champ select or no teammates found')}}catch(e){}}
+else{dlgAlert('No Teammates Found','Not in champ select, or no teammates found.')}}catch(e){}}
 async function showBans(){
 var box=document.getElementById('histBox');box.innerHTML='<div style="color:var(--textm);font-size:9px;padding:4px">Fetching ban suggestions for '+cR+'...</div>';
 try{var bans=JSON.parse(await pywebview.api.get_ban_suggestions(cR));
@@ -2024,34 +2585,93 @@ box.innerHTML='';
 bans.forEach(function(b){
 var row=document.createElement('div');
 row.style.cssText='display:flex;align-items:center;gap:6px;padding:3px 6px;border-radius:4px;margin-bottom:2px;background:rgba(255,78,80,.04);border-left:2px solid var(--danger);cursor:pointer';
-row.innerHTML='<img src="'+cI(b.img)+'" style="width:24px;height:24px;border-radius:3px">'+
+row.innerHTML='<img src="'+cI(b.img)+'" alt="" style="width:24px;height:24px;border-radius:3px">'+
 '<span style="font-size:10px;font-weight:600;color:var(--text)">'+b.name+'</span>'+
 '<span style="font-size:9px;font-family:JetBrains Mono;color:var(--danger);margin-left:auto">'+(b.banRate*100).toFixed(1)+'% ban</span>';
 row.onclick=function(){selC=b;asgn('ban',b)};
 box.appendChild(row)})}catch(e){box.innerHTML='<div style="color:var(--textm);font-size:9px;padding:4px">Failed to fetch</div>'}}
-function rTB(){var c=document.getElementById('tb');c.innerHTML='';TGS.forEach(function(t){var d=document.createElement('div');d.className='tg'+(t===aT?' on':'');d.textContent=t;d.onclick=function(){aT=t;rTB();rG()};c.appendChild(d)})}
+function rTB(){var c=document.getElementById('tb');c.innerHTML='';TGS.forEach(function(t){var d=document.createElement('div');d.className='tg'+(t===aT?' on':'');d.textContent=RS.indexOf(t)>=0?RN[t]:t;d.onclick=async function(){aT=t;rTB();if(RS.indexOf(t)>=0){var g=document.getElementById('cg');g.innerHTML='<div class="nr">LOADING '+RN[t]+' PICKS…</div>';await loadRolePool(t)}rG()};c.appendChild(d)})}
+// Favorited for your assigned role (cR) OR for whichever lane tab you're currently
+// browsing (aT) — so a champion favorited for JNG reads as favorited while you're
+// looking at the JNG tab, even if your own assigned role this game is TOP.
+function isFavOf(c){return favsList.indexOf(c.id)>=0||(favsByRole[cR]||[]).indexOf(c.id)>=0||(RS.indexOf(aT)>=0&&(favsByRole[aT]||[]).indexOf(c.id)>=0)}
+function mkChTile(c){
+var wrap=document.createElement('div');wrap.style.cssText='position:relative';
+var d=document.createElement('button');d.type='button';d.className='ch';d.setAttribute('data-id',c.id);
+var isFav=isFavOf(c);
+d.setAttribute('aria-label',c.name+(isFav?' (favorite)':'')+' — right-click to favorite');
+if(isFav)d.style.cssText='border:2px solid var(--gold);background:rgba(200,170,110,.06);border-radius:6px';
+d.innerHTML='<div style="position:relative"><img src="'+cI(c.img)+'" alt="" onerror="this.style.opacity=0.1"'+(isFav?' style="border-color:var(--gold)"':'')+'>'+
+'</div><div class="cn"'+(isFav?' style="color:var(--gold)"':'')+'>'+c.name+'</div>';
+d.onclick=function(){champClick(c,d)};
+d.oncontextmenu=function(e){e.preventDefault();showFavMenu(e,c)};
+wrap.appendChild(d);return wrap}
 function rG(){var q=document.getElementById('sb').value.toLowerCase(),g=document.getElementById('cg');g.innerHTML='';
 var f=aC.filter(function(c){return c.name.toLowerCase().indexOf(q)>=0});
-if(aT==='Favorites')f=f.filter(function(c){return favsList.indexOf(c.id)>=0});
+if(aT==='Favorites')f=f.filter(isFavOf);
 else if(aT==='Recent')f=f.filter(function(c){return recentList.indexOf(c.id)>=0});
-else if(aT!=='ALL')f=f.filter(function(c){return c.tags&&c.tags.indexOf(aT)>=0});
+else if(RS.indexOf(aT)>=0){var pool=roleFilterCache[aT]||[];
+// A champion favorited (globally, or specifically for this lane) always shows
+// here too, even if op.gg/Blitz don't list them as commonly played in it —
+// additive only: this never removes them from their real meta lane's tab.
+f=f.filter(function(c){return pool.indexOf(c.name.toLowerCase())>=0||favsList.indexOf(c.id)>=0||(favsByRole[aT]||[]).indexOf(c.id)>=0})}
+f=f.slice().sort(function(a,b){return (isFavOf(b)?1:0)-(isFavOf(a)?1:0)});
 document.getElementById('pcnt').textContent=f.length+' / '+aC.length;
-if(!f.length){g.innerHTML='<div class="nr">'+(aT==='Favorites'?'NO FAVORITES YET — CLICK ★ ON CHAMPIONS':'NO CHAMPIONS FOUND')+'</div>';return}
-f.forEach(function(c){var d=document.createElement('div');d.className='ch';d.setAttribute('data-id',c.id);
-var isFav=favsList.indexOf(c.id)>=0;
-if(isFav)d.style.cssText='border:2px solid var(--gold);background:rgba(200,170,110,.06);border-radius:6px';
-d.innerHTML='<div style="position:relative"><img src="'+cI(c.img)+'" onerror="this.style.opacity=0.1"'+(isFav?' style="border-color:var(--gold)"':'')+'>'+
-'<div id="fav_'+c.id+'" style="position:absolute;top:-4px;right:-4px;width:20px;height:20px;border-radius:50%;cursor:pointer;font-size:13px;display:flex;align-items:center;justify-content:center;'+
-(isFav?'background:var(--gold);color:var(--bg);text-shadow:none':'background:rgba(1,10,19,.7);color:rgba(200,170,110,.3);text-shadow:0 0 4px rgba(0,0,0,.8)')+
-'" onmousedown="event.stopPropagation()" onclick="event.stopPropagation();togFav('+c.id+')">'+(isFav?'★':'☆')+'</div>'+
-'</div><div class="cn"'+(isFav?' style="color:var(--gold)"':'')+'>'+c.name+'</div>';
-d.onclick=function(){champClick(c,d)};g.appendChild(d)})}
+// Smart Pick — a selectable pseudo-champion, always first. Set as a role's Pick
+// (like any real champion) to let that lane resolve live instead of a fixed champ.
+var sc=document.createElement('button');sc.type='button';sc.className='ch';sc.setAttribute('data-id','SMART');
+sc.setAttribute('aria-label','Smart Pick — let the app choose your champion based on your team and the enemy');
+sc.style.cssText='border:2px solid var(--bordercyan);background:rgba(10,200,185,.06);border-radius:6px';
+sc.innerHTML='<div style="position:relative"><div style="width:100%;aspect-ratio:1;display:flex;align-items:center;justify-content:center;font-size:26px;border-radius:4px;background:rgba(10,200,185,.1)">🧠</div></div><div class="cn" style="color:var(--cyan)">Smart Pick</div>';
+sc.onclick=function(){champClick({id:'SMART',name:'Smart Pick',img:null,tags:[]},sc)};
+g.appendChild(sc);
+if(!f.length){var nr=document.createElement('div');nr.className='nr';nr.textContent=(aT==='Favorites'?'NO FAVORITES YET — RIGHT-CLICK A CHAMPION':'NO CHAMPIONS FOUND');g.appendChild(nr);return}
+if(ownedList.length){
+var fOwned=f.filter(function(c){return ownedList.indexOf(c.id)>=0});
+var fUnowned=f.filter(function(c){return ownedList.indexOf(c.id)<0});
+fOwned.forEach(function(c){g.appendChild(mkChTile(c))});
+if(fUnowned.length){
+var div=document.createElement('div');div.style.cssText='grid-column:1/-1;font-family:Orbitron;font-size:8px;font-weight:700;letter-spacing:3px;color:var(--textm);padding:8px 2px 4px;border-top:1px solid var(--border);margin-top:4px';
+div.textContent='NOT OWNED ('+fUnowned.length+')';g.appendChild(div);
+fUnowned.forEach(function(c){var t=mkChTile(c);t.style.opacity='0.45';t.style.filter='grayscale(0.6)';g.appendChild(t)})}
+}else{f.forEach(function(c){g.appendChild(mkChTile(c))})}}
+async function showFavMenu(e,c){
+var old=document.getElementById('favMenu');if(old)old.remove();
+var isGlobalFav=favsList.indexOf(c.id)>=0;
+var menu=document.createElement('div');menu.id='favMenu';
+menu.style.cssText='position:fixed;left:'+e.clientX+'px;top:'+e.clientY+'px;background:rgba(9,20,40,.97);border:1px solid var(--border);border-radius:8px;padding:4px;z-index:700;min-width:200px;box-shadow:0 16px 40px rgba(0,0,0,.5);font-family:Rajdhani';
+function row(label,active,onclick){
+var r=document.createElement('div');r.style.cssText='padding:7px 10px;border-radius:5px;cursor:pointer;font-size:12px;font-weight:600;color:'+(active?'var(--gold)':'var(--text)')+';display:flex;align-items:center;gap:6px';
+r.innerHTML=(active?'★':'☆')+' '+label;
+r.onmouseover=function(){r.style.background='rgba(10,200,185,.08)'};
+r.onmouseout=function(){r.style.background='transparent'};
+r.onclick=function(){menu.remove();onclick()};
+return r}
+menu.appendChild(row('Favorite (Global)',isGlobalFav,async function(){await togFav(c.id)}));
+var div=document.createElement('div');div.style.cssText='height:1px;background:var(--border);margin:4px 2px';menu.appendChild(div);
+RS.forEach(function(r){
+var isRoleFav=(favsByRole[r]||[]).indexOf(c.id)>=0;
+menu.appendChild(row('Favorite for '+RN[r],isRoleFav,async function(){
+try{var lst=JSON.parse(await pywebview.api.set_role_favorite(String(c.id),r,!isRoleFav));favsByRole[r]=lst;
+toast((isRoleFav?'Unfavorited ':'Favorited ')+c.name+' for '+RN[r],'success');rG()}
+catch(e){toast('Save failed: '+(e&&e.message?e.message:e),'warn')}}))});
+document.body.appendChild(menu);
+var mr=menu.getBoundingClientRect();
+var left=e.clientX,top=e.clientY;
+if(left+mr.width>window.innerWidth)left=Math.max(4,window.innerWidth-mr.width-4);
+if(top+mr.height>window.innerHeight)top=Math.max(4,window.innerHeight-mr.height-4);
+menu.style.left=left+'px';menu.style.top=top+'px';
+setTimeout(function(){document.addEventListener('click',function dismiss(){menu.remove();document.removeEventListener('click',dismiss)})},0)}
 function selChamp(c){selC=c;if(sM){asgn(sM,c);sM=null;rT();return}
 document.querySelectorAll('.ch').forEach(function(el){el.classList.toggle('sel',el.getAttribute('data-id')==String(c.id))});
 var si=document.getElementById('selInfo');si.style.display='flex';
 document.getElementById('selImg').src=cI(c.img);
 document.getElementById('selName').textContent=c.name;
-document.getElementById('selTags').textContent=(c.tags||[]).join(' · ');
+pywebview.api.get_config('TOP').then(function(r){try{
+var fcfg=JSON.parse(r);var ovKey=c.id+'_'+cR;var ov=(fcfg.favorite_tags||{})[ovKey];
+var bs=(fcfg.build_style_tags||{})[ovKey];
+document.getElementById('selTags').textContent=(c.tags||[]).join(' · ')+(ov?' · 🏷 '+ROLE_LABELS[ov]+' ('+cR+')':'')+(bs?' · 🧪 '+bs.toUpperCase()+' ('+cR+')':'')
+}catch(e){document.getElementById('selTags').textContent=(c.tags||[]).join(' · ')}});
 document.getElementById('selWR').textContent='';
 pywebview.api.get_champ_winrate(String(c.id)).then(function(r){try{
 var d=JSON.parse(r);if(d){var col=d.rate>=50?'var(--success)':'var(--danger)';
@@ -2061,6 +2681,37 @@ document.getElementById('selNote').style.display='none';
 pywebview.api.get_champ_note(String(c.id)).then(function(n){
 if(n){document.getElementById('selNote').textContent='📝 '+n;document.getElementById('selNote').style.display='block'}
 })}
+var ROLE_LABELS={tank:'Tank',bruiser:'Bruiser',ap:'AP',burst:'Burst/Assassin',ad_carry:'AD Carry',utility:'Utility/Support'};
+async function setCompRole(){if(!selC)return;
+var choice=await dlgChoice('Smart Pick Comp Role — '+RN[cR],'How do YOU actually build '+selC.name+' in '+RN[cR]+'? Overrides the generic tags Smart Pick uses to judge team comp fit for THIS role only — playing '+selC.name+' elsewhere keeps its own setting. Only affects scoring, not in-game builds.',[
+{value:'tank',label:'Tank',color:'var(--cyan)'},
+{value:'bruiser',label:'Bruiser',color:'var(--cyan)'},
+{value:'ap',label:'AP',color:'var(--gold)'},
+{value:'burst',label:'Burst / Assassin',color:'var(--danger)'},
+{value:'ad_carry',label:'AD Carry',color:'var(--gold)'},
+{value:'utility',label:'Utility / Support',color:'var(--success)'},
+{value:'auto',label:'Auto (use default tags)',color:'var(--border)'}
+]);
+if(!choice)return;
+try{await pywebview.api.set_favorite_tag(selC.id,cR,choice);
+toast(choice==='auto'?'🏷 '+selC.name+' ('+RN[cR]+'): back to default tags':'🏷 '+selC.name+' in '+RN[cR]+' scored as '+ROLE_LABELS[choice]+' from now on','success');
+selChamp(selC)}
+catch(e){toast('Save failed','warn')}}
+async function setBuildStyle(){if(!selC)return;
+var choice=await dlgChoice('Build Style — '+selC.name+' ('+RN[cR]+')','Which build should Auto-Items chase for '+selC.name+' in '+RN[cR]+'? No API key needed — it ranks U.GG/Blitz/Lolalytics builds by item tags and imports whichever matches. Set independently per role — '+selC.name+' elsewhere keeps its own setting.',[
+{value:'ap',label:'AP',desc:'Ability power, spell damage, magic pen items',color:'var(--gold)'},
+{value:'ad',label:'AD Carry',desc:'Crit, attack speed, life steal, on-hit items',color:'var(--gold)'},
+{value:'tank',label:'Tank',desc:'Health + armor/magic resist, no damage stats',color:'var(--cyan)'},
+{value:'bruiser',label:'Bruiser',desc:'Health + damage hybrid items',color:'var(--cyan)'},
+{value:'burst',label:'Burst / Assassin',desc:'Lethality/magic pen burst, no sustained-DPS stats',color:'var(--danger)'},
+{value:'utility',label:'Utility / Support',desc:'Vision, auras, gold-generation items',color:'var(--success)'},
+{value:'auto',label:'Auto (whatever is most popular)',color:'var(--border)'}
+]);
+if(!choice)return;
+try{await pywebview.api.set_build_style(selC.id,cR,choice);
+toast(choice==='auto'?'🧪 '+selC.name+' ('+RN[cR]+'): back to the popular build':'🧪 '+selC.name+' in '+RN[cR]+' will import '+choice.toUpperCase()+' builds from now on','success');
+selChamp(selC)}
+catch(e){toast('Save failed','warn')}}
 /* DOUBLE-CLICK: assign to current mode (pick/ban/backup) */
 var lastClick={id:0,time:0};
 function champClick(c,el){
@@ -2078,13 +2729,13 @@ box.appendChild(el);
 setTimeout(function(){el.classList.add('out');setTimeout(function(){el.remove()},200)},2000)}
 async function editNote(){if(!selC)return;
 var cur=await pywebview.api.get_champ_note(String(selC.id));
-var n=prompt('Note for '+selC.name+':',cur||'');
+var n=await dlgPrompt('Champion Note','Note for '+selC.name+':',cur||'');
 if(n!==null){await pywebview.api.set_champ_note(String(selC.id),n);
 if(n){document.getElementById('selNote').textContent='📝 '+n;document.getElementById('selNote').style.display='block'}
 else{document.getElementById('selNote').style.display='none'}}}
-function openOpgg(){if(!selC)return;window.open('https://www.op.gg/champions/'+selC.img.toLowerCase(),'_blank')}
-function openUgg(){if(!selC)return;window.open('https://u.gg/lol/champions/'+selC.img.toLowerCase()+'/build','_blank')}
-function openCounters(){if(!selC)return;window.open('https://u.gg/lol/champions/'+selC.img.toLowerCase()+'/matchups','_blank')}
+function openOpgg(){if(!selC||!selC.img)return;window.open('https://www.op.gg/champions/'+selC.img.toLowerCase(),'_blank')}
+function openUgg(){if(!selC||!selC.img)return;window.open('https://u.gg/lol/champions/'+selC.img.toLowerCase()+'/build','_blank')}
+function openCounters(){if(!selC||!selC.img)return;window.open('https://u.gg/lol/champions/'+selC.img.toLowerCase()+'/matchups','_blank')}
 /* KEYBOARD SHORTCUTS */
 document.addEventListener('keydown',function(e){
 if(e.target.tagName==='INPUT')return;
@@ -2094,17 +2745,23 @@ if(e.key==='k'||e.key==='K'){if(selC)doQBk()}
 if(e.key==='r'||e.key==='R'){doRandom()}
 if(e.key==='Escape'){clM();document.getElementById('setOvl').classList.remove('show')}
 })
-async function swapSp(){try{await pywebview.api.swap_spells(cR);toast('⇄ Spells swapped','info')}catch(e){}rSp()}
-async function swapBkSp(){try{await pywebview.api.swap_backup_spells(cR);toast('⇄ Backup spells swapped','info')}catch(e){}rSp()}
+async function swapSp(){try{await pywebview.api.swap_spells(cR);toast('⇄ Spells swapped','info');rSp()}catch(e){toast('Spell swap failed','warn')}}
+async function swapBkSp(){try{await pywebview.api.swap_backup_spells(cR);toast('⇄ Backup spells swapped','info');rSp()}catch(e){toast('Backup spell swap failed','warn')}}
 async function impItems(){try{var ok=await pywebview.api.import_items_now(cR);
-toast(ok?'📦 Items imported!':'📦 No items found','ok'?'success':'warn')}catch(e){}}
+toast(ok?'📦 Items imported!':'📦 No items found',ok?'success':'warn')}catch(e){}}
 async function togFav(champId){try{var favs=JSON.parse(await pywebview.api.toggle_favorite(String(champId)));
 favsList=favs;var c=cMap[champId];var isFav=favs.indexOf(champId)>=0;
 toast(isFav?'★ '+((c&&c.name)||'Champion')+' favorited':'☆ '+((c&&c.name)||'Champion')+' unfavorited',isFav?'gold':'info');
 rG()}catch(e){}}
-var favsList=[];var recentList=[];
-async function loadFavs(){try{favsList=JSON.parse(await pywebview.api.get_favorites())}catch(e){favsList=[]}}
-async function loadRecent(){try{recentList=JSON.parse(await pywebview.api.get_recently_played())}catch(e){recentList=[]}}async function asgn(mode,c){try{
+var favsList=[];var recentList=[];var favsByRole={};var ownedList=[];var ownedLoaded=false;var roleFilterCache={};
+async function loadFavs(){try{favsList=JSON.parse(await callApiRetry(function(){return pywebview.api.get_favorites()},20,150))}catch(e){favsList=[]}}
+async function loadRecent(){try{recentList=JSON.parse(await callApiRetry(function(){return pywebview.api.get_recently_played()},20,150))}catch(e){recentList=[]}}
+async function loadFavsByRole(){try{var cfg=JSON.parse(await pywebview.api.get_config('TOP'));favsByRole=cfg.favorites_by_role||{}}catch(e){favsByRole={}}}
+async function loadOwned(){try{ownedList=JSON.parse(await pywebview.api.get_owned_champions())}catch(e){ownedList=[]}rG()}
+async function loadRolePool(role){if(roleFilterCache[role])return;
+try{roleFilterCache[role]=JSON.parse(await pywebview.api.get_role_pool(role)).map(function(n){return n.toLowerCase()})}
+catch(e){roleFilterCache[role]=[]}}
+async function asgn(mode,c){try{
 await pywebview.api.set_setting(cR,mode+'_id',String(c.id));
 await pywebview.api.set_setting(cR,mode+'_name',c.name);
 await pywebview.api.set_setting(cR,mode+'_img',c.img);
@@ -2125,45 +2782,50 @@ await pywebview.api.set_setting(r,'backup_spell2_id','__null__');await pywebview
 }catch(e){}selC=null;toast('✕ Cleared '+mode,'info');rT();rSp();rRn();rG()}
 async function rT(){try{
 var allCfgs={};
-for(var ri=0;ri<RS.length;ri++){allCfgs[RS[ri]]=JSON.parse(await pywebview.api.get_config(RS[ri]))}
+for(var ri=0;ri<RS.length;ri++){allCfgs[RS[ri]]=JSON.parse(await callApiRetry(function(){return pywebview.api.get_config(RS[ri])},20,150))}
 var cfg=allCfgs[cR];
 var ts=document.getElementById('ts');ts.innerHTML='';
 RS.forEach(function(r){var isU=(r===cR);var rCfg=allCfgs[r];
 var s=document.createElement('div');s.className='slot'+(isU?' on':'');
-var pImg=rCfg.pick_img?cI(rCfg.pick_img):'';var pNm=rCfg.pick_name||'None';
-s.innerHTML='<img class="pt '+(pImg?'':'emp')+'" src="'+(pImg||PX)+'"><div class="si"><div class="rl">'+RN[r]+(isU?' <span class="you">♛ YOU</span>':'')+'</div><div class="nm '+(pNm==='None'||pNm==='—'?'emp':'')+'">'+(pNm==='None'?'—':pNm)+'</div></div>'+(pImg?'<div style="cursor:pointer;color:var(--textm);font-size:11px;padding:2px 4px;border-radius:3px" onmouseover="this.style.color=\'var(--danger)\'" onmouseout="this.style.color=\'var(--textm)\'" onclick="event.stopPropagation();clr(\'pick\',\''+r+'\')">✕</div>':'');
-s.onclick=function(){if(cR!==r){cR=r;rT();rSp();rRn();document.getElementById('selInfo').style.display='none';document.getElementById('selNote').style.display='none'}};ts.appendChild(s)});
+var isSmart=rCfg.pick_id==='SMART';
+var pImg=rCfg.pick_img?cI(rCfg.pick_img):'';var pNm=isSmart?'Smart Pick':(rCfg.pick_name||'None');
+var imgHtml=isSmart?'<div class="pt" style="display:flex;align-items:center;justify-content:center;font-size:18px;background:rgba(10,200,185,.12)">🧠</div>':('<img class="pt '+(pImg?'':'emp')+'" alt="" src="'+(pImg||PX)+'">');
+s.innerHTML=imgHtml+'<div class="si"><div class="rl">'+RN[r]+(isU?' <span class="you">♛ YOU</span>':'')+'</div><div class="nm '+(pNm==='None'||pNm==='—'?'emp':'')+'">'+(pNm==='None'?'—':pNm)+'</div></div>'+((pImg||isSmart)?'<button type="button" class="iconx" aria-label="Clear '+RN[r]+' pick" style="cursor:pointer;color:var(--textm);font-size:11px;padding:2px 4px;border-radius:3px" onmouseover="this.style.color=\'var(--danger)\'" onmouseout="this.style.color=\'var(--textm)\'" onclick="event.stopPropagation();clr(\'pick\',\''+r+'\')">✕</button>':'');
+s.onclick=async function(){if(cR!==r){cR=r;rT();rSp();rRn();document.getElementById('selInfo').style.display='none';document.getElementById('selNote').style.display='none';
+aT=r;rTB();if(!roleFilterCache[r]){var g=document.getElementById('cg');g.innerHTML='<div class="nr">LOADING '+RN[r]+' PICKS…</div>';await loadRolePool(r)}rG()}};ts.appendChild(s)});
 var bs=document.getElementById('bsl');bs.innerHTML='';
 // Ban slot with cancel
 var bImg=cfg.ban_img?cI(cfg.ban_img):'';
 var bWrap=document.createElement('div');bWrap.style.cssText='position:relative;display:inline-block';
 var be=document.createElement('div');be.className='bs'+(sM==='ban'?' on':'');
-be.innerHTML=(bImg?'<img src="'+bImg+'">':'')+'<div class="bs-label">BAN</div>';
+be.innerHTML=(bImg?'<img src="'+bImg+'" alt="">':'')+'<div class="bs-label">BAN</div>';
 be.onclick=function(){sM=sM==='ban'?null:'ban';rT()};bWrap.appendChild(be);
-if(bImg){var bx=document.createElement('div');bx.style.cssText='position:absolute;top:-4px;right:-4px;width:16px;height:16px;border-radius:50%;background:rgba(255,78,80,.8);color:#fff;font-size:10px;cursor:pointer;display:flex;align-items:center;justify-content:center;z-index:2;font-weight:700';bx.textContent='✕';bx.onclick=function(e){e.stopPropagation();clr('ban')};bWrap.appendChild(bx)}
+if(bImg){var bx=document.createElement('button');bx.type='button';bx.setAttribute('aria-label','Clear ban');bx.className='iconx';bx.style.cssText='position:absolute;top:-4px;right:-4px;width:16px;height:16px;border-radius:50%;background:rgba(255,78,80,.8);color:#fff;font-size:10px;cursor:pointer;display:flex;align-items:center;justify-content:center;z-index:2;font-weight:700';bx.textContent='✕';bx.onclick=function(e){e.stopPropagation();clr('ban')};bWrap.appendChild(bx)}
 bs.appendChild(bWrap);
 // Backup slot with cancel
 var bkImg=cfg.backup_img?cI(cfg.backup_img):'';
 var bkWrap=document.createElement('div');bkWrap.style.cssText='position:relative;display:inline-block';
 var bke=document.createElement('div');bke.className='bs'+(sM==='backup'?' on':'');bke.style.borderColor='rgba(200,170,110,.3)';
-bke.innerHTML=(bkImg?'<img src="'+bkImg+'">':'')+'<div class="bs-label" style="color:var(--gold)">BACKUP</div>';
+bke.innerHTML=(bkImg?'<img src="'+bkImg+'" alt="">':'')+'<div class="bs-label" style="color:var(--gold)">BACKUP</div>';
 bke.onclick=function(){sM=sM==='backup'?null:'backup';rT()};bkWrap.appendChild(bke);
-if(bkImg){var bkx=document.createElement('div');bkx.style.cssText='position:absolute;top:-4px;right:-4px;width:16px;height:16px;border-radius:50%;background:rgba(255,78,80,.8);color:#fff;font-size:10px;cursor:pointer;display:flex;align-items:center;justify-content:center;z-index:2;font-weight:700';bkx.textContent='✕';bkx.onclick=function(e){e.stopPropagation();clr('backup')};bkWrap.appendChild(bkx)}
+if(bkImg){var bkx=document.createElement('button');bkx.type='button';bkx.setAttribute('aria-label','Clear backup pick');bkx.className='iconx';bkx.style.cssText='position:absolute;top:-4px;right:-4px;width:16px;height:16px;border-radius:50%;background:rgba(255,78,80,.8);color:#fff;font-size:10px;cursor:pointer;display:flex;align-items:center;justify-content:center;z-index:2;font-weight:700';bkx.textContent='✕';bkx.onclick=function(e){e.stopPropagation();clr('backup')};bkWrap.appendChild(bkx)}
 bs.appendChild(bkWrap);
 document.getElementById('bc').textContent=(cfg.ban_name&&cfg.ban_name!=='None'?'1':'0')+'/1'}catch(e){}}
-async function rSp(){try{var cfg=JSON.parse(await pywebview.api.get_config(cR));
+async function rSp(){try{var cfg=JSON.parse(await callApiRetry(function(){return pywebview.api.get_config(cR)},20,150));
 var r=document.getElementById('sr');r.innerHTML='';
-[[cfg.spell1_img,'spell1',1],[cfg.spell2_img,'spell2',2]].forEach(function(x){
-var url=x[0]?sI(x[0]):'';var el=document.createElement('div');el.className='ss';
-el.innerHTML=url?'<img src="'+url+'">':'';el.onclick=function(){openSpM(x[2],'main')};r.appendChild(el)});
+[[cfg.spell1_img,'spell1',1,cfg.spell1_name],[cfg.spell2_img,'spell2',2,cfg.spell2_name]].forEach(function(x){
+var url=x[0]?sI(x[0]):'';var el=document.createElement('button');el.type='button';el.className='ss';
+el.setAttribute('aria-label','Summoner spell '+x[2]+(x[3]&&x[3]!=='None'?': '+x[3]:': none selected'));
+el.innerHTML=url?'<img src="'+url+'" alt="">':'';el.onclick=function(){openSpM(x[2],'main')};r.appendChild(el)});
 // Backup spells
 var br=document.getElementById('bsr');br.innerHTML='';
-[[cfg.backup_spell1_img,'backup_spell1',1],[cfg.backup_spell2_img,'backup_spell2',2]].forEach(function(x){
-var url=x[0]?sI(x[0]):'';var el=document.createElement('div');el.className='ss';
+[[cfg.backup_spell1_img,'backup_spell1',1,cfg.backup_spell1_name],[cfg.backup_spell2_img,'backup_spell2',2,cfg.backup_spell2_name]].forEach(function(x){
+var url=x[0]?sI(x[0]):'';var el=document.createElement('button');el.type='button';el.className='ss';
+el.setAttribute('aria-label','Backup summoner spell '+x[2]+(x[3]&&x[3]!=='None'?': '+x[3]:': none selected'));
 el.style.borderColor='rgba(200,170,110,.3)';
-el.innerHTML=url?'<img src="'+url+'">':'';el.onclick=function(){openSpM(x[2],'backup')};br.appendChild(el)})
+el.innerHTML=url?'<img src="'+url+'" alt="">':'';el.onclick=function(){openSpM(x[2],'backup')};br.appendChild(el)})
 }catch(e){}}
-async function rRn(){try{var cfg=JSON.parse(await pywebview.api.get_config(cR));
+async function rRn(){try{var cfg=JSON.parse(await callApiRetry(function(){return pywebview.api.get_config(cR)},20,150));
 document.getElementById('rsl').textContent=cfg.rune_name&&cfg.rune_name!=='None'?'📜 '+cfg.rune_name:'— Select runes';
 document.getElementById('brsl').textContent=cfg.backup_rune_name&&cfg.backup_rune_name!=='None'?'📜 '+cfg.backup_rune_name:'— Backup runes';
 var preview=document.getElementById('runePreview');preview.innerHTML='';
@@ -2173,7 +2835,7 @@ var box=document.createElement('div');box.className='rune-display';
 var perks=document.createElement('div');perks.className='rune-perks';
 rd.selectedPerkIds.forEach(function(pid,idx){
 var pk=document.createElement('div');pk.className='rune-perk'+(idx===0?' ks':'');
-var icon=pI(pid);if(icon)pk.innerHTML='<img src="'+icon+'" title="'+(runeMap[String(pid)]?runeMap[String(pid)].name:'')+'">';
+var icon=pI(pid);if(icon)pk.innerHTML='<img src="'+icon+'" alt="'+(runeMap[String(pid)]?runeMap[String(pid)].name:'')+'">';
 perks.appendChild(pk)});box.appendChild(perks);preview.appendChild(box)}}catch(e){}}
 var mI=[],mCb=null;
 function openSpM(slot,spellType){document.getElementById('mt').textContent=(spellType==='backup'?'BACKUP ':'')+' SPELL '+slot;document.getElementById('ms').value='';
@@ -2182,9 +2844,9 @@ var prefix=spellType==='backup'?'backup_spell':'spell';
 mCb=async function(item){try{
 await pywebview.api.set_setting(cR,prefix+slot+'_id',String(item.id));
 await pywebview.api.set_setting(cR,prefix+slot+'_name',item.name);
-await pywebview.api.set_setting(cR,prefix+slot+'_img',item.img)}catch(e){}rSp()};
+await pywebview.api.set_setting(cR,prefix+slot+'_img',item.img);rSp()}catch(e){toast('Spell selection failed','warn')}};
 document.getElementById('mbg').classList.add('show');fM();setTimeout(function(){document.getElementById('ms').focus()},100)}
-async function openRuneM(target){runeTarget=target;var items=[];try{items=JSON.parse(await pywebview.api.get_rune_pages(target,cR))}catch(e){}
+async function openRuneM(target){runeTarget=target;var items=[];try{items=JSON.parse(await pywebview.api.get_rune_pages(target,cR))}catch(e){toast('Rune page fetch failed','warn')}
 document.getElementById('mt').textContent=target==='backup_rune'?'BACKUP RUNE PAGE':'RUNE PAGE';document.getElementById('ms').value='';mI=items;
 mCb=async function(item){try{
 var idK=runeTarget+'_id',nmK=runeTarget+'_name',dataK=runeTarget+'_data';
@@ -2192,7 +2854,8 @@ if(item.source==='recommended'&&item.data){
 await pywebview.api.set_setting(cR,idK,'__null__');await pywebview.api.set_setting(cR,nmK,item.name);
 await pywebview.api.set_setting(cR,dataK,JSON.stringify(item.data))}
 else{await pywebview.api.set_setting(cR,idK,String(item.id));await pywebview.api.set_setting(cR,nmK,item.name);
-await pywebview.api.set_setting(cR,dataK,'__null__')}}catch(e){}rRn()};
+await pywebview.api.set_setting(cR,dataK,'__null__')}
+rRn()}catch(e){toast('Rune selection failed','warn')}};
 document.getElementById('mbg').classList.add('show');fM()}
 function clM(){document.getElementById('mbg').classList.remove('show')}
 function fM(){var q=document.getElementById('ms').value.toLowerCase(),list=document.getElementById('ml');list.innerHTML='';
@@ -2203,9 +2866,9 @@ var perkHtml='';
 if(item.data&&item.data.selectedPerkIds&&item.data.selectedPerkIds.length>0){
 perkHtml='<div class="rpv">';
 item.data.selectedPerkIds.slice(0,6).forEach(function(pid,idx){
-var icon=pI(pid);if(icon)perkHtml+='<img src="'+icon+'" class="'+(idx===0?'ks':'')+'">';});
+var icon=pI(pid);if(icon)perkHtml+='<img src="'+icon+'" alt="" class="'+(idx===0?'ks':'')+'">';});
 perkHtml+='</div>'}
-d.innerHTML=(iu?'<img src="'+iu+'">':'')+
+d.innerHTML=(iu?'<img src="'+iu+'" alt="">':'')+
 '<span class="mn">'+item.name+'</span>'+perkHtml+
 (item.source?'<span class="src">'+(item.source==='recommended'?'⭐ OP.GG':'📄 MY PAGE')+'</span>':'');
 d.onclick=function(){clM();if(mCb)mCb(item);toast('📜 '+item.name,'success')};list.appendChild(d)})}
@@ -2222,20 +2885,21 @@ function rP(){var ps=[
 var c=document.getElementById('pl');c.innerHTML='';
 ps.forEach(function(p){var row=document.createElement('div');row.className='pr';
 var ex=p.btn?'<button class="hb" onclick="'+p.ba+'()">'+p.btn+'</button>':'';
-row.innerHTML='<div class="pi"><div class="pn">'+p.icon+' '+p.nm+'</div><div class="pd">'+p.ds+'</div></div>'+ex+'<div class="sw" id="sw_'+p.key+'" onclick="tS(\''+p.key+'\')"></div>';
+row.innerHTML='<div class="pi"><div class="pn">'+p.icon+' '+p.nm+'</div><div class="pd">'+p.ds+'</div></div>'+ex+'<button type="button" class="sw" role="switch" aria-checked="false" aria-label="'+p.nm+'" id="sw_'+p.key+'" onclick="tS(\''+p.key+'\')"></button>';
 c.appendChild(row)});lS()}
 async function lS(){try{var cfg=JSON.parse(await pywebview.api.get_config('TOP'));
-['auto_accept','auto_ban','auto_pick','auto_spells','auto_runes','auto_items','sound_alert','chat_on','afk_on'].forEach(function(k){var el=document.getElementById('sw_'+k);if(el)el.classList.toggle('on',!!cfg[k])});uPB()}catch(e){}}
-async function tS(k){var el=document.getElementById('sw_'+k);var on=!el.classList.contains('on');el.classList.toggle('on',on);
+['auto_accept','auto_ban','auto_pick','auto_spells','auto_runes','auto_items','sound_alert','chat_on','afk_on'].forEach(function(k){var el=document.getElementById('sw_'+k);if(el){el.classList.toggle('on',!!cfg[k]);el.setAttribute('aria-checked',String(!!cfg[k]))}});uPB()}catch(e){}}
+async function tS(k){var el=document.getElementById('sw_'+k);var on=!el.classList.contains('on');el.classList.toggle('on',on);el.setAttribute('aria-checked',String(on));
 try{await pywebview.api.set_global(k,on)}catch(e){}uPB();
 var names={auto_accept:'Auto-Accept',auto_ban:'Auto-Ban',auto_pick:'Auto-Pick',auto_spells:'Auto-Spells',auto_runes:'Auto-Runes',auto_items:'Auto-Items',sound_alert:'Sound Alert',chat_on:'Auto-Chat',afk_on:'Anti-AFK'};
 toast((names[k]||k)+': '+(on?'ON':'OFF'),on?'success':'info')}
 function uPB(){var on=0;var total=0;document.querySelectorAll('.sw').forEach(function(t){total++;if(t.classList.contains('on'))on++});
 document.getElementById('pbdg').textContent=on+'/'+total+' ON'}
-async function eC(){var m=prompt('Chat message:','GLHF');if(m)try{await pywebview.api.set_global('chat_msg',m)}catch(e){}}
-async function eA(){var v=prompt('Idle seconds (5-120):','30');if(v)try{await pywebview.api.set_global('afk_threshold',v)}catch(e){}}
-async function doD(){if(confirm('Dodge? You will lose LP.')){try{await pywebview.api.dodge();toast('⚠ Dodged queue','warn')}catch(e){}}}
-async function togglePause(){try{await pywebview.api.toggle_pause_pick()}catch(e){}}
+async function eC(){var m=await dlgPrompt('Auto-Chat Message','Message to send on champ select entry:','GLHF');if(m)try{await pywebview.api.set_global('chat_msg',m)}catch(e){toast('Save failed','warn')}}
+async function eA(){var v=await dlgPrompt('Anti-AFK Threshold','Idle seconds before anti-AFK kicks in (5-120):','30');if(v)try{await pywebview.api.set_global('afk_threshold',v)}catch(e){toast('Save failed','warn')}}
+async function doD(){if(await dlgConfirm('Dodge Queue','Dodge? You will lose LP.',{confirmLabel:'DODGE',danger:true})){try{await pywebview.api.dodge();toast('⚠ Dodged queue','warn')}catch(e){toast('Dodge failed','warn')}}}
+async function togglePause(){try{var on=await pywebview.api.toggle_pause_pick();
+toast(on?'⏸ Auto-pick PAUSED — pick manually in client':'▶ Auto-lock RESUMED',on?'warn':'success')}catch(e){}}
 async function pauseAndPickManually(){
 try{await pywebview.api.toggle_pause_pick();
 window._pickPopupDismissed=true;
@@ -2260,6 +2924,9 @@ var cats=[
 {key:'auto_runes',nm:'Auto-Runes',ds:'Import rune page after locking pick'},
 {key:'auto_items',nm:'Auto-Items',ds:'Import item build from op.gg after locking pick'}
 ]},
+{title:'SMART PICK',items:[
+{key:'_sppool',nm:'Candidate Pool',ds:'Favorites = only your starred champs. All = every champ commonly played in your role. Arm Smart Pick itself from the 🧠 Smart Pick tile in the champion grid, per role — or the 🧠 button above the grid to arm every lane at once',action:'changeSmartPickPool'}
+]},
 {title:'ALERTS',items:[
 {key:'sound_alert',nm:'Sound Alert',ds:'Beep when match found + timer warning at 5s'}
 ]},
@@ -2279,9 +2946,9 @@ var h=document.createElement('div');h.className='scat';h.textContent=cat.title;c
 cat.items.forEach(function(item){
 var row=document.createElement('div');row.className='srow';
 if(item.action){
-row.innerHTML='<div class="si2"><div class="sn">'+item.nm+'</div><div class="sd">'+item.ds+'</div></div><button class="hb" onclick="'+item.action+'()">GO</button>';
+row.innerHTML='<div class="si2"><div class="sn">'+item.nm+'</div><div class="sd" id="sd_'+item.key+'">'+item.ds+'</div></div><button class="hb" onclick="'+item.action+'()">'+(item.btn||'GO')+'</button>';
 }else{
-row.innerHTML='<div class="si2"><div class="sn">'+item.nm+'</div><div class="sd">'+item.ds+'</div></div><div class="sw" id="set_'+item.key+'" onclick="togSet(\''+item.key+'\')"></div>';
+row.innerHTML='<div class="si2"><div class="sn">'+item.nm+'</div><div class="sd">'+item.ds+'</div></div><button type="button" class="sw" role="switch" aria-checked="false" aria-label="'+item.nm+'" id="set_'+item.key+'" onclick="togSet(\''+item.key+'\')"></button>';
 }
 c.appendChild(row)})});
 document.getElementById('setOvl').classList.add('show');
@@ -2290,30 +2957,30 @@ function closeSettings(){document.getElementById('setOvl').classList.remove('sho
 async function loadSetStates(){try{
 var cfg=JSON.parse(await pywebview.api.get_config('TOP'));
 ['light_mode','lite_mode','auto_minimize','auto_spells','auto_runes','auto_items','sound_alert'].forEach(function(k){
-var el=document.getElementById('set_'+k);if(el)el.classList.toggle('on',!!cfg[k])})}catch(e){}}
+var el=document.getElementById('set_'+k);if(el){el.classList.toggle('on',!!cfg[k]);el.setAttribute('aria-checked',String(!!cfg[k]))}})}catch(e){}}
 async function togSet(k){
-var el=document.getElementById('set_'+k);var on=!el.classList.contains('on');el.classList.toggle('on',on);
+var el=document.getElementById('set_'+k);var on=!el.classList.contains('on');el.classList.toggle('on',on);el.setAttribute('aria-checked',String(on));
 try{await pywebview.api.set_global(k,on)}catch(e){}
 if(k==='light_mode'){document.body.classList.toggle('light',on);toast(on?'☀ Light Mode':'🌙 Dark Mode','info')}
 if(k==='lite_mode'){document.body.classList.toggle('lite',on);toast(on?'⚡ Lite Mode ON':'✨ Effects ON','info')}}
 async function expCfg(){try{var d=await pywebview.api.export_config();
-if(navigator.clipboard){await navigator.clipboard.writeText(d);alert('Config copied to clipboard!')}
-else{prompt('Copy this:',d)}}catch(e){alert('Export failed')}}
-async function impCfg(){var d=prompt('Paste config JSON:');if(d){try{
+if(navigator.clipboard){await navigator.clipboard.writeText(d);toast('📋 Config copied to clipboard!','success')}
+else{await dlgPrompt('Export Config','Copy this config JSON:',d)}}catch(e){await dlgAlert('Export Failed','Could not export the config.')}}
+async function impCfg(){var d=await dlgPrompt('Import Config','Paste config JSON:');if(d){try{
 var ok=await pywebview.api.import_config(d);
-if(ok){alert('Config imported! Reloading...');location.reload()}
-else{alert('Invalid config')}}catch(e){alert('Import failed')}}}
-async function rstCfg(){if(confirm('Reset ALL settings to defaults? This cannot be undone.')){
-try{await pywebview.api.reset_config();alert('Config reset! Reloading...');location.reload()}catch(e){}}}
+if(ok){await dlgAlert('Config Imported','Reloading...');location.reload()}
+else{await dlgAlert('Invalid Config','That JSON could not be read as a valid config.')}}catch(e){await dlgAlert('Import Failed','Could not import the config.')}}}
+async function rstCfg(){if(await dlgConfirm('Reset All Settings','Reset ALL settings to defaults? This cannot be undone.',{confirmLabel:'RESET',danger:true})){
+try{await pywebview.api.reset_config();await dlgAlert('Config Reset','Reloading...');location.reload()}catch(e){toast('Reset failed','warn')}}}
 async function openMyOpgg(){try{var s=JSON.parse(await pywebview.api.get_status());
 if(s.summoner)window.open('https://www.op.gg/summoners/'+curRegion+'/'+encodeURIComponent(s.summoner),'_blank');
-else alert('Not connected yet')}catch(e){}}
+else toast('Not connected yet','warn')}catch(e){}}
 async function openPoro(){try{var names=JSON.parse(await pywebview.api.lookup_team());
 if(names.length){window.open('https://porofessor.gg/pregame/'+curRegion+'/'+encodeURIComponent(names[0]),'_blank')}
 else{var s=JSON.parse(await pywebview.api.get_status());
 if(s.summoner)window.open('https://porofessor.gg/pregame/'+curRegion+'/'+encodeURIComponent(s.summoner),'_blank');
-else alert('Not connected')}}catch(e){}}
-async function clearAllRoles(){if(!confirm('Clear ALL picks/bans/backups from every role?'))return;
+else toast('Not connected','warn')}}catch(e){}}
+async function clearAllRoles(){if(!await dlgConfirm('Clear All Roles','Clear ALL picks/bans/backups from every role?',{confirmLabel:'CLEAR ALL',danger:true}))return;
 var roles=['TOP','JUNGLE','MIDDLE','BOTTOM','UTILITY'];
 var keys=['pick','ban','backup'];
 for(var ri=0;ri<roles.length;ri++){for(var ki=0;ki<keys.length;ki++){
@@ -2324,21 +2991,28 @@ rT();rSp();rRn();rG()}
 function clearLog(){document.getElementById('lga').innerHTML='<div class="ll"><span class="ts">['+new Date().toTimeString().slice(0,8)+']</span><span class="ok">Console cleared</span></div>'}
 async function changeRegion(){
 var regions=['euw','eune','na','kr','jp','oce','br','las','lan','tr','ru','sg','ph','tw','th','vn'];
-var cur=curRegion;
-var r=prompt('Current: '+cur.toUpperCase()+'\\n\\nAvailable regions:\\n'+regions.map(function(x){return x.toUpperCase()}).join(', ')+'\\n\\nType your region:');
-if(r){r=r.toLowerCase().trim();
-if(regions.indexOf(r)>=0){curRegion=r;
-try{await pywebview.api.set_global('region',r)}catch(e){}
-toast('🌍 Region: '+r.toUpperCase(),'success')}
-else{toast('Unknown region: '+r,'warn')}}}
+var r=await dlgChoice('Server Region','Current: '+curRegion.toUpperCase(),regions.map(function(x){return{value:x,label:x.toUpperCase(),color:x===curRegion?'var(--cyan)':'var(--border)'}}));
+if(r){curRegion=r;
+try{await pywebview.api.set_global('region',r)}catch(e){toast('Save failed','warn');return}
+toast('🌍 Region: '+r.toUpperCase(),'success')}}
 async function changeBuildSource(){
 var cur=await pywebview.api.get_build_source();
-var r=prompt('Current item source: '+(cur||'not set').toUpperCase()+'\\nRunes are always from U.GG\\n\\nAvailable item sources:\\nUGG — Same as runes, all from one page\\nBLITZ — Popular item builds\\nLOLALYTICS — High sample stats\\n\\nType source name:');
-if(r){r=r.toLowerCase().trim();
-if(['ugg','blitz','lolalytics'].indexOf(r)>=0){
-try{await pywebview.api.set_global('build_source',r)}catch(e){}
-toast('🛒 Item source: '+r.toUpperCase(),'success')}
-else{toast('Unknown source. Use: ugg, blitz, or lolalytics','warn')}}}
+var sources=[
+{value:'ugg',label:'U.GG',desc:'Same as runes — all from one page',color:'var(--cyan)'},
+{value:'blitz',label:'Blitz.gg',desc:'Popular item builds',color:'var(--gold)'},
+{value:'lolalytics',label:'Lolalytics',desc:'High sample size stats',color:'var(--success)'}
+];
+var r=await dlgChoice('Item Build Source','Current: '+(cur||'not set').toUpperCase()+' · Runes are always from U.GG',sources);
+if(r){
+try{await pywebview.api.set_global('build_source',r)}catch(e){toast('Save failed','warn');return}
+toast('🛒 Item source: '+r.toUpperCase(),'success')}}
+async function changeSmartPickPool(){
+var cfg=JSON.parse(await pywebview.api.get_config('TOP'));
+var cur=cfg.smart_pick_pool||'favorites';
+var next=cur==='favorites'?'all':'favorites';
+if(await dlgConfirm('Smart Pick Pool','Currently '+cur.toUpperCase()+'. Switch to '+next.toUpperCase()+'?\n\nFAVORITES = only your starred champs\nALL = every champ commonly played in your role (op.gg)',{confirmLabel:'SWITCH'})){
+try{await pywebview.api.set_global('smart_pick_pool',next)}catch(e){toast('Save failed','warn');return}
+toast('🧠 Pool: '+next.toUpperCase(),'success')}}
 var pendingUpdateUrl=null;
 async function checkUpdate(){try{
 var r=JSON.parse(await pywebview.api.check_update());
@@ -2346,22 +3020,24 @@ if(r.available){
 pendingUpdateUrl=r.url;
 document.getElementById('updateBanner').style.display='block';
 document.getElementById('updateBanner').textContent='⬆ UPDATE v'+r.latest+' AVAILABLE'+(r.url?' — CLICK TO INSTALL':' — visit GitHub');
-alert('Update available!\\n\\nCurrent: v'+r.current+'\\nLatest: v'+r.latest+'\\n\\n'+(r.notes||'')+'\\n\\n'+(r.url?'Click the green banner to install.':'Visit: '+r.html_url))
-}else{alert('You are on the latest version (v'+r.current+')')}}catch(e){alert('Update check failed — check your internet connection')}}
+await dlgAlert('Update Available','Current: v'+r.current+'\nLatest: v'+r.latest+'\n\n'+(r.notes||'')+'\n\n'+(r.url?'Click the green banner to install.':'Visit: '+r.html_url))
+}else{await dlgAlert('Up to Date','You are on the latest version (v'+r.current+')')}}catch(e){await dlgAlert('Update Check Failed','Check your internet connection and try again.')}}
 async function doUpdate(){if(!pendingUpdateUrl){window.open('https://github.com/jimman0I/League-Auto-Accept-Enhanced-Menu','_blank');return}
-if(!confirm('Download and install update? The app will restart.'))return;
+if(!await dlgConfirm('Install Update','Download and install update? The app will restart.',{confirmLabel:'INSTALL',danger:true}))return;
 try{document.getElementById('updateBanner').textContent='⬆ DOWNLOADING UPDATE...';
 var r=JSON.parse(await pywebview.api.do_update(pendingUpdateUrl));
-if(!r.success){alert('Download failed — try downloading manually from GitHub')}}catch(e){alert('Update failed: '+e)}}
+if(!r.success){await dlgAlert('Download Failed','Try downloading manually from GitHub.')}}catch(e){await dlgAlert('Update Failed',String(e))}}
 
 async function poll(){try{var s=JSON.parse(await pywebview.api.get_status());
 document.getElementById('dot').className='dot'+(s.connected?' on':'');
 document.getElementById('sn').textContent=s.connected?s.summoner:'Searching...';
 document.getElementById('sn').style.color=s.connected?'var(--text)':'var(--textm)';
+document.getElementById('resumeBtn').style.display=(s.phase==='ChampSelect'&&s.pause_pick)?'inline-block':'none';
 if(s.connected){document.getElementById('pav').textContent=s.summoner.charAt(0).toUpperCase();
 document.getElementById('pnm').textContent=s.summoner.toUpperCase();
 document.getElementById('pdt').textContent='Lvl '+s.level+' · Phase: '+s.phase+(s.role&&s.phase==='ChampSelect'?' · '+s.role:'');
-document.getElementById('prank').textContent=s.rank?(s.rank+' · '+s.lp+' LP'+(s.wr?' · '+s.wr+' WR':'')):''}
+document.getElementById('prank').textContent=s.rank?(s.rank+' · '+s.lp+' LP'+(s.wr?' · '+s.wr+' WR':'')):'';
+if(!ownedLoaded){ownedLoaded=true;loadOwned()}}
 // Stats bar
 var sb=document.getElementById('statsBar');
 if(s.connected&&s.stats){
@@ -2394,25 +3070,29 @@ var lp=document.getElementById('livePicks');lp.innerHTML='';
 var c=cMap[a.champId];var img=c?cI(c.img):'';
 var el=document.createElement('div');
 el.style.cssText='width:32px;height:32px;border-radius:4px;border:2px solid '+(a.isMe?'var(--cyan)':'var(--border)')+';background:var(--bg);overflow:hidden';
-if(img)el.innerHTML='<img src="'+img+'" style="width:100%;height:100%">';
-el.title=(c?c.name:'?')+' — '+(a.position||'?');
+if(img)el.innerHTML='<img src="'+img+'" alt="'+(c?c.name:'?')+' — '+(a.position||'?')+'" style="width:100%;height:100%">';
 lp.appendChild(el)});
 var le=document.getElementById('liveEnemies');le.innerHTML='';
 (s.enemies||[]).forEach(function(a){
 var c=cMap[a.champId];var img=c?cI(c.img):'';
 var el=document.createElement('div');
 el.style.cssText='width:32px;height:32px;border-radius:4px;border:2px solid var(--danger);background:var(--bg);overflow:hidden;opacity:'+(a.champId?'1':'0.2');
-if(img)el.innerHTML='<img src="'+img+'" style="width:100%;height:100%">';
-el.title=c?c.name:'Unknown';
+if(img)el.innerHTML='<img src="'+img+'" alt="'+(c?c.name:'Unknown')+'" style="width:100%;height:100%">';
 le.appendChild(el)});
 var lb=document.getElementById('liveBans');lb.innerHTML='';
 (s.bans||[]).forEach(function(bid){
 var c=cMap[bid];var img=c?cI(c.img):'';
 var el=document.createElement('div');
 el.style.cssText='width:24px;height:24px;border-radius:3px;border:1px solid rgba(255,78,80,.3);background:var(--bg);overflow:hidden;opacity:0.5;filter:grayscale(1)';
-if(img)el.innerHTML='<img src="'+img+'" style="width:100%;height:100%">';
-el.title=c?c.name:'?';
+if(img)el.innerHTML='<img src="'+img+'" alt="'+(c?c.name:'?')+'" style="width:100%;height:100%">';
 lb.appendChild(el)})
+var spb=document.getElementById('smartPickBox');
+if(s.smart_pick){spb.style.display='block';
+document.getElementById('spImg').src=cI(s.smart_pick.img);
+document.getElementById('spName').textContent=s.smart_pick.name;
+var rs=(s.smart_pick.reasons||[]);
+document.getElementById('spReasons').textContent=rs.length?rs.slice(-2).join(' · '):'comp pick'}
+else{spb.style.display='none'}
 }else{liveEl.style.display='none'}
 // Pick popup — shows when it's your turn to pick with auto-pick ON
 var pp=document.getElementById('pickPopup');
@@ -2424,8 +3104,8 @@ if(isPick&&!window._pickPopupDismissed){
 try{var pcfg=JSON.parse(await pywebview.api.get_config(cR));
 if(pcfg.pick_name&&pcfg.pick_name!=='None'&&pcfg.auto_pick){
 pp.style.display='flex';
-document.getElementById('ppImg').src=pcfg.pick_img?cI(pcfg.pick_img):'';
-document.getElementById('ppName').textContent=pcfg.pick_name;
+document.getElementById('ppImg').src=pcfg.pick_id==='SMART'?PX:(pcfg.pick_img?cI(pcfg.pick_img):'');
+document.getElementById('ppName').textContent=pcfg.pick_id==='SMART'?'🧠 Smart Pick':pcfg.pick_name;
 document.getElementById('ppTimer').textContent=String(Math.floor(s.time_left/60)).padStart(2,'0')+':'+String(s.time_left%60).padStart(2,'0');
 document.getElementById('ppTimer').style.color=s.time_left<=5?'var(--danger)':'var(--cyan)';
 }else{pp.style.display='none'}}catch(e){}
@@ -2448,7 +3128,33 @@ function waitForApi(){if(window.pywebview&&window.pywebview.api)init();else setT
 document.addEventListener('DOMContentLoaded',waitForApi);
 </script></body></html>"""
 
+def _acquire_single_instance_lock():
+    """Refuse to start a second instance. Two Engines polling the same LCU
+    session at once double up pick/lock/chat actions and race to write the
+    same lol_config.json — exactly the kind of thing that makes the app feel
+    unresponsive or inconsistent. A lock whose PID is no longer alive (stale,
+    e.g. after a crash) is silently reclaimed."""
+    lock_path="hextech_draft.lock"
+    try:
+        if os.path.exists(lock_path):
+            with open(lock_path) as f:
+                old_pid=int((f.read() or '0').strip() or 0)
+            import psutil
+            if old_pid and psutil.pid_exists(old_pid):
+                try:
+                    import ctypes
+                    ctypes.windll.user32.MessageBoxW(0,"Hextech Draft is already running.","Hextech Draft",0x40)
+                except Exception:pass
+                sys.exit(0)
+        with open(lock_path,'w') as f:
+            f.write(str(os.getpid()))
+    except SystemExit:
+        raise
+    except Exception:
+        pass  # never block startup over the lock mechanism itself
+
 def main():
+    _acquire_single_instance_lock()
     import webview
     api=Api()
     window=webview.create_window('Hextech Draft',html=HTML,js_api=api,width=1200,height=820,resizable=True,background_color='#010A13')
