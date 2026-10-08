@@ -1,40 +1,97 @@
-# ⚔️ Hextech Draft — League Auto-Accept (Enhanced Menu)
+<div align="center">
 
-[![Latest Release](https://img.shields.io/github/v/release/jimman0I/League-Auto-Accept-Enhanced-Menu?label=release&color=C89B3C)](https://github.com/jimman0I/League-Auto-Accept-Enhanced-Menu/releases/latest)
-[![Downloads](https://img.shields.io/github/downloads/jimman0I/League-Auto-Accept-Enhanced-Menu/total?color=0AC8B9)](https://github.com/jimman0I/League-Auto-Accept-Enhanced-Menu/releases)
-[![License](https://img.shields.io/github/license/jimman0I/League-Auto-Accept-Enhanced-Menu?color=1E2328)](LICENSE)
-[![Stars](https://img.shields.io/github/stars/jimman0I/League-Auto-Accept-Enhanced-Menu?style=social)](https://github.com/jimman0I/League-Auto-Accept-Enhanced-Menu/stargazers)
+<img src="hextech_icon.png" alt="" width="64" height="64" />
 
-A lightweight Windows desktop app that talks to the **League of Legends Client API (LCU)** to automate the boring parts of getting into a game — accepting queues, picking/banning, applying runes & spells, and more — wrapped in a clean, themeable Hextech-styled interface.
+# ⚔️ Hextech Draft — League of Legends Auto-Accept, Smart Pick &amp; Champ-Select Automation
 
-It interacts **only** with Riot's official local client API (`lockfile` auth over the documented REST endpoints). It does **not** read or write game memory, inject DLLs, or modify client files.
+<img src="docs/diagrams/readme-hero.svg" width="100%" alt="Hextech Draft: every click before the loading screen, automated. Auto-Accept, Smart Pick, lane-aware champion pool, auto-runes and spells, item builds, anti-AFK, favorites per lane." />
 
-![Hextech Draft screenshot](docs/screenshot.webp)
+<br/>
 
----
+[![Latest release](https://img.shields.io/github/v/release/jimman0I/League-Auto-Accept-Enhanced-Menu?style=for-the-badge&color=C8AA6E&label=release)](https://github.com/jimman0I/League-Auto-Accept-Enhanced-Menu/releases/latest)
+[![Downloads](https://img.shields.io/github/downloads/jimman0I/League-Auto-Accept-Enhanced-Menu/total?style=for-the-badge&color=0AC8B9&label=downloads)](https://github.com/jimman0I/League-Auto-Accept-Enhanced-Menu/releases)
+![Platform](https://img.shields.io/badge/Windows-10%20%7C%2011-091428?style=for-the-badge&logo=windows&logoColor=white)
+[![License](https://img.shields.io/github/license/jimman0I/League-Auto-Accept-Enhanced-Menu?style=for-the-badge&color=00FF9C)](LICENSE)
+![No API key](https://img.shields.io/badge/API%20key-never%20needed-FF4E50?style=for-the-badge)
+
+<br/>
+
+**Auto-Accept** · **Smart Pick** · **Lane-aware champion pool** · **Per-role runes, spells &amp; item builds** · **Anti-AFK**
+
+[**⬇️ Download for Windows**](https://github.com/jimman0I/League-Auto-Accept-Enhanced-Menu/releases/latest) &nbsp;·&nbsp; [Quick start](#quick-start) &nbsp;·&nbsp; [Features](#-features) &nbsp;·&nbsp; [Report a bug](https://github.com/jimman0I/League-Auto-Accept-Enhanced-Menu/issues/new)
+
+</div>
+
+<br/>
+
+> League's own client makes you sit through a ready-check click, a lane-dependent
+> champion decision, a rune page, a spell set and an item-shop build — every
+> single game. **Hextech Draft watches the client's own phase state and does
+> each of those the moment it's legal to**, using only Riot's documented LCU
+> REST API.
+
+It talks **only** to `127.0.0.1` through the League client's own lockfile-authenticated
+API. No memory reads, no DLL injection, no client file modification — if you can see
+it in the UI, it's one documented endpoint call away.
+
+<div align="center">
+
+<img src="docs/screenshot.webp" alt="Hextech Draft's main window: a Hextech-gold and cyan themed dashboard showing per-role Smart Pick slots for Top, Jungle, Mid, ADC and Support, a searchable lane-filtered champion pool, live preferences toggles for Auto-Accept, Auto-Ban, Auto-Pick, Auto-Spells, Auto-Runes, Auto-Items and Anti-AFK, and a live console streaming what the app just did." width="880" />
+
+<br/>
+<br/>
+
+### ⭐ If this saves you a click every game, star the repo — it helps others find it.
+
+[![Stars](https://img.shields.io/github/stars/jimman0I/League-Auto-Accept-Enhanced-Menu?style=social)](https://github.com/jimman0I/League-Auto-Accept-Enhanced-Menu)
+
+</div>
+
+<br/>
+
+## 🎬 How It Works
+
+<img src="docs/diagrams/how-it-works.svg" width="100%" alt="How Hextech Draft works: it polls the League client for Ready Check, Accepts automatically, then in Champion Select it Bans, Smart-Picks or locks your preset champion, applies Runes and Spells, and once the game starts imports your Item Build — all hands-free, phase by phase." />
+
+The app discovers the running League client via its `lockfile`, authenticates
+against the local LCU REST API, and polls the game-flow phase (`ReadyCheck`,
+`ChampSelect`, `InProgress`). Each automation fires the moment its phase is
+legal — nothing is simulated, nothing is pre-timed, it's all driven by the
+client's own state.
+
+<br/>
 
 ## ✨ Features
 
-- 🟢 **Auto Accept** — instantly accepts ready checks / matchmaking queues
-- 🎯 **Auto Pick & Ban** — selects and **locks in** your preferred champion per role, with tag filters and favorites
-- 📖 **Auto Runes** — fetches recommended rune pages from **U.GG** and applies them after lock-in
-- ✨ **Auto Spells** — applies your preset summoner spells (with one-click swap)
-- 🛒 **Item Builds** — pulls recommended builds from your choice of **U.GG**, **Blitz.gg**, or **Lolalytics**
-- 💬 **Auto Chat** — sends custom messages in champion select
-- 🛡️ **Anti-AFK** — prevents idle disconnects
-- 🚪 **Dodge** — bail out of a lobby in one click
-- 🧩 **Per-Role Configs** — independent picks, bans, runes, and spells for every position
-- 🎨 **Themes & Zoom** — light / lite modes and adjustable UI scale
-- 🌍 **Region Aware** — set your region for build lookups
-- 💾 **Persistent Config** — settings saved to `lol_config.json` between sessions
-- ⬆️ **Built-in Auto-Update** — checks GitHub Releases on launch and updates itself in place (see below)
+| | |
+| --- | --- |
+| 🟢 **Auto-Accept** | Instantly accepts ready checks / matchmaking queues — no more missed pops |
+| 🧠 **Smart Pick** | Weighs your team comp, lane, and the enemy's picks live, then suggests (or auto-locks) a champion — free, no API key, no LLM |
+| 🗺️ **Lane-Aware Champion Pool** | The grid filters by Top / Jungle / Mid / ADC / Support instead of generic class tags — click a role, see who's actually played there |
+| ★ **Favorites, Global or Per-Lane** | Right-click any champion to favorite them globally or for one specific lane; they show up in that lane's tab *and* count as a Smart Pick candidate, without leaving their usual lane |
+| 🎯 **Auto Pick &amp; Ban** | Selects and **locks in** your preferred champion per role |
+| 📖 **Auto Runes** | Fetches a recommended rune page and applies it after lock-in |
+| ✨ **Auto Spells** | Applies your preset summoner spells, with one-click swap |
+| 🛒 **Item Builds, Your Way** | Pulls recommended builds from **U.GG**, **Blitz.gg**, or **Lolalytics** — or override per-role with a 6-category build style (Tank / Bruiser / AP / Burst-Assassin / AD-Carry / Utility), computed locally from item tags, no network judgment call needed |
+| 💬 **Auto Chat** | Sends a custom message in champion select |
+| 🛡️ **Anti-AFK** | Prevents idle disconnects while you're reading a build |
+| 🚪 **Dodge** | Bail out of a lobby in one click |
+| 🧩 **Per-Role Configs** | Independent picks, bans, runes, spells and build styles for every position |
+| 🎨 **Themes &amp; Zoom** | Light / lite modes and an adjustable UI scale |
+| 🌍 **Region Aware** | Set your region once for build lookups |
+| 💾 **Persistent Config** | Everything saved to `lol_config.json` between sessions |
+| ⬆️ **Built-in Auto-Update** | Checks GitHub Releases on launch and updates itself in place |
+
+<br/>
+
+<a id="quick-start"></a>
 
 ## 🚀 Quick Start (no Python needed)
 
 1. Download the latest **`HextechDraft.exe`** from the [**Releases**](https://github.com/jimman0I/League-Auto-Accept-Enhanced-Menu/releases/latest) page.
 2. Launch the League of Legends client and log in.
 3. Run `HextechDraft.exe`. It auto-connects to your running client.
-4. On first launch, pick your item build source. Configure picks, bans, runes, spells, and toggles in the UI.
+4. On first launch, pick your item build source. Configure picks, bans, runes, spells and toggles in the UI.
 5. Leave it running — it acts automatically at the right moments.
 
 > **First-run warning:** because the exe isn't code-signed, Windows SmartScreen may show *"Windows protected your PC"* the first time you run it. Click **More info → Run anyway**. This is expected for small open-source tools and the prompt goes away on its own as more people download it.
@@ -43,7 +100,7 @@ It interacts **only** with Riot's official local client API (`lockfile` auth ove
 
 You don't need to re-download the app to get new versions. On every launch, Hextech Draft quietly checks this repo's GitHub Releases. When a newer release is published, an **"⬆ UPDATE AVAILABLE"** banner appears in the header — click it and the app downloads the new `.exe`, swaps itself out, and restarts. No manual reinstall required.
 
-> Maintainer note: to ship an update, bump `APP_VERSION` in `hextech_auto_accept.py`, rebuild the exe, and publish a new GitHub Release whose tag matches the version (e.g. `v1.0.1`) with the `.exe` attached as a release asset.
+> Maintainer note: to ship an update, bump `APP_VERSION` in `hextech_auto_accept.py`, rebuild the exe, and publish a new GitHub Release whose tag matches the version (e.g. `v1.1.0`) with the `.exe` attached as a release asset.
 
 ## 🛠️ Run / Build from Source
 
@@ -57,10 +114,6 @@ python hextech_auto_accept.py
 # Or build a standalone exe (output: dist/HextechDraft.exe)
 build_exe.bat
 ```
-
-## ⚙️ How It Works
-
-The app discovers the running League client via its `lockfile`, authenticates against the local LCU REST API, and polls the game-flow phase (`ReadyCheck`, `ChampSelect`, `InProgress`). Each automation is triggered at the correct phase, so everything happens hands-free.
 
 ## ⚠️ Disclaimer
 
