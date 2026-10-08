@@ -7,20 +7,59 @@
     <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
       <path d="M0 0 L10 5 L0 10 z" fill="#C8AA6E" fill-opacity="0.7"/>
     </marker>
+    <radialGradient id="pulseglow" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#0AC8B9" stop-opacity="1"/>
+      <stop offset="100%" stop-color="#0AC8B9" stop-opacity="0"/>
+    </radialGradient>
   </defs>
+
+  <style>
+    /* Every node and label is fully visible without animation — the moving
+       pulse and sequential glow are ambient polish layered on top, never a
+       gate on whether the flow is readable. */
+    @media (prefers-reduced-motion: reduce) {
+      .hw-anim, .hw-anim * { animation: none !important; }
+      #hw-pulse, #hw-pulse-core { animation: none !important; opacity: 0 !important; }
+    }
+    .hw-node { animation: hwGlow 7.2s ease-in-out infinite; }
+    .hw-node.n1 { animation-delay: 0s; }
+    .hw-node.n2 { animation-delay: .5s; }
+    .hw-node.n3 { animation-delay: 1s; }
+    .hw-node.n4 { animation-delay: 1.9s; }
+    .hw-node.n5 { animation-delay: 2.4s; }
+    .hw-node.n6 { animation-delay: 2.9s; }
+    @keyframes hwGlow { 0%, 86%, 100% { filter: none; } 92% { filter: drop-shadow(0 0 6px currentColor); } }
+    .hw-dash { stroke-dasharray: 3 5; animation: hwMarch 1.4s linear infinite; }
+    @keyframes hwMarch { to { stroke-dashoffset: -16; } }
+  </style>
+
+  <g class="hw-anim">
 
   <rect x="1" y="1" width="1198" height="278" rx="14" fill="url(#bg2)" stroke="#C8AA6E" stroke-opacity="0.3" stroke-width="1.5"/>
 
   <text x="600" y="36" text-anchor="middle" font-family="Georgia, 'Times New Roman', serif" font-size="12" letter-spacing="5" fill="#8A8272">HOW IT WORKS — ONE PASS, EVERY PHASE</text>
 
-  <!-- flow line -->
-  <line x1="108" y1="150" x2="1092" y2="150" stroke="#C8AA6E" stroke-opacity="0.25" stroke-width="1.5" stroke-dasharray="3 5"/>
+  <!-- flow line the pulse travels along -->
+  <path id="hw-track" d="M108 150 H1092" fill="none" stroke="none"/>
+  <line class="hw-dash" x1="108" y1="150" x2="1092" y2="150" stroke="#C8AA6E" stroke-opacity="0.3" stroke-width="1.5"/>
+
+  <!-- traveling pulse: a glowing dot runs the length of the flow on loop -->
+  <circle id="hw-pulse-core" r="4.5" fill="#0AC8B9">
+    <animateMotion dur="7.2s" repeatCount="indefinite" keyPoints="0;1;1" keyTimes="0;0.86;1" calcMode="linear">
+      <mpath href="#hw-track"/>
+    </animateMotion>
+  </circle>
+  <circle id="hw-pulse" r="12" fill="url(#pulseglow)">
+    <animateMotion dur="7.2s" repeatCount="indefinite" keyPoints="0;1;1" keyTimes="0;0.86;1" calcMode="linear">
+      <mpath href="#hw-track"/>
+    </animateMotion>
+  </circle>
 
   <!-- node template: 6 phases -->
   <g font-family="Arial, Helvetica, sans-serif">
 
     <!-- 1 Ready Check -->
-    <g transform="translate(40,95)">
+    <g class="hw-node n1" transform="translate(40,95)" style="color:#00FF9C">
       <rect width="150" height="78" rx="9" fill="#091428" stroke="#00FF9C" stroke-opacity="0.45" stroke-width="1.5"/>
       <text x="75" y="28" text-anchor="middle" font-size="22">🔔</text>
       <text x="75" y="50" text-anchor="middle" font-size="12" font-weight="700" fill="#00FF9C">READY CHECK</text>
@@ -30,7 +69,7 @@
     <line x1="190" y1="150" x2="222" y2="150" stroke="#C8AA6E" stroke-width="2" marker-end="url(#arrow)"/>
 
     <!-- 2 Auto-Accept -->
-    <g transform="translate(228,95)">
+    <g class="hw-node n2" transform="translate(228,95)" style="color:#00FF9C">
       <rect width="150" height="78" rx="9" fill="#091428" stroke="#00FF9C" stroke-opacity="0.45" stroke-width="1.5"/>
       <text x="75" y="28" text-anchor="middle" font-size="22">✅</text>
       <text x="75" y="50" text-anchor="middle" font-size="12" font-weight="700" fill="#00FF9C">AUTO-ACCEPT</text>
@@ -40,7 +79,7 @@
     <line x1="378" y1="150" x2="410" y2="150" stroke="#C8AA6E" stroke-width="2" marker-end="url(#arrow)"/>
 
     <!-- 3 Champ Select: Ban/Pick -->
-    <g transform="translate(416,80)">
+    <g class="hw-node n3" transform="translate(416,80)" style="color:#0AC8B9">
       <rect width="190" height="108" rx="9" fill="#091428" stroke="#0AC8B9" stroke-opacity="0.5" stroke-width="1.5"/>
       <text x="95" y="28" text-anchor="middle" font-size="22">⚔️</text>
       <text x="95" y="50" text-anchor="middle" font-size="12" font-weight="700" fill="#0AC8B9">CHAMP SELECT</text>
@@ -52,7 +91,7 @@
     <line x1="606" y1="150" x2="638" y2="150" stroke="#C8AA6E" stroke-width="2" marker-end="url(#arrow)"/>
 
     <!-- 4 Runes + Spells -->
-    <g transform="translate(644,95)">
+    <g class="hw-node n4" transform="translate(644,95)" style="color:#C8AA6E">
       <rect width="150" height="78" rx="9" fill="#091428" stroke="#C8AA6E" stroke-opacity="0.5" stroke-width="1.5"/>
       <text x="75" y="28" text-anchor="middle" font-size="22">📖</text>
       <text x="75" y="50" text-anchor="middle" font-size="12" font-weight="700" fill="#C8AA6E">RUNES &amp; SPELLS</text>
@@ -62,7 +101,7 @@
     <line x1="794" y1="150" x2="826" y2="150" stroke="#C8AA6E" stroke-width="2" marker-end="url(#arrow)"/>
 
     <!-- 5 Loading -->
-    <g transform="translate(832,95)">
+    <g class="hw-node n5" transform="translate(832,95)" style="color:#F0E6D2">
       <rect width="130" height="78" rx="9" fill="#091428" stroke="#A09B8C" stroke-opacity="0.4" stroke-width="1.5"/>
       <text x="65" y="28" text-anchor="middle" font-size="22">⏳</text>
       <text x="65" y="50" text-anchor="middle" font-size="12" font-weight="700" fill="#F0E6D2">LOADING</text>
@@ -72,7 +111,7 @@
     <line x1="962" y1="150" x2="994" y2="150" stroke="#C8AA6E" stroke-width="2" marker-end="url(#arrow)"/>
 
     <!-- 6 In Game -->
-    <g transform="translate(1000,80)">
+    <g class="hw-node n6" transform="translate(1000,80)" style="color:#FF4E50">
       <rect width="160" height="108" rx="9" fill="#091428" stroke="#FF4E50" stroke-opacity="0.45" stroke-width="1.5"/>
       <text x="80" y="28" text-anchor="middle" font-size="22">🛒</text>
       <text x="80" y="50" text-anchor="middle" font-size="12" font-weight="700" fill="#FF4E50">IN GAME</text>
@@ -83,4 +122,6 @@
   </g>
 
   <text x="600" y="248" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="11" fill="#8A8272">Every step talks only to Riot's official, documented LCU REST API on 127.0.0.1 — no memory reads, no injection, no client files touched.</text>
+
+  </g>
 </svg>

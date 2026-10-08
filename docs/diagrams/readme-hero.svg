@@ -10,21 +10,52 @@
       <stop offset="100%" stop-color="#C8AA6E" stop-opacity="0"/>
     </linearGradient>
     <linearGradient id="titlefade" x1="0" y1="0" x2="1" y2="0">
-      <stop offset="0%" stop-color="#C8AA6E"/>
-      <stop offset="55%" stop-color="#F0E6D2"/>
-      <stop offset="100%" stop-color="#C8AA6E"/>
+      <stop offset="0%" stop-color="#C8AA6E">
+        <animate attributeName="offset" values="-0.4;1;-0.4" dur="5s" repeatCount="indefinite"/>
+      </stop>
+      <stop offset="50%" stop-color="#F8F1E0">
+        <animate attributeName="offset" values="0.1;1.5;0.1" dur="5s" repeatCount="indefinite"/>
+      </stop>
+      <stop offset="100%" stop-color="#C8AA6E">
+        <animate attributeName="offset" values="0.6;2;0.6" dur="5s" repeatCount="indefinite"/>
+      </stop>
     </linearGradient>
+    <clipPath id="scanClip">
+      <rect x="260" y="124" width="680" height="10"/>
+    </clipPath>
   </defs>
+
+  <style>
+    /* Content is always fully visible without animation — motion here is
+       ambient polish only, never a gate on whether something renders. */
+    @media (prefers-reduced-motion: reduce) {
+      .hx-anim, .hx-anim * { animation: none !important; }
+    }
+    .hx-chip { opacity: 1; animation: hxPulse 4.5s ease-in-out infinite; }
+    .hx-chip:nth-child(1) { animation-delay: 0s; }
+    .hx-chip:nth-child(2) { animation-delay: .75s; }
+    .hx-chip:nth-child(3) { animation-delay: 1.5s; }
+    .hx-chip:nth-child(4) { animation-delay: 2.25s; }
+    .hx-chip:nth-child(5) { animation-delay: 3s; }
+    .hx-chip:nth-child(6) { animation-delay: 3.75s; }
+    @keyframes hxPulse { 0%, 100% { filter: none; } 50% { filter: drop-shadow(0 0 4px currentColor); } }
+    .hx-corner { opacity: .6; animation: hxCorner 3.2s ease-in-out infinite; }
+    @keyframes hxCorner { 0%, 100% { opacity: .35; } 50% { opacity: .85; } }
+    .hx-beam { animation: hxBeam 3.6s linear infinite; }
+    @keyframes hxBeam { 0% { transform: translateX(-420px); } 100% { transform: translateX(420px); } }
+  </style>
+
+  <g class="hx-anim">
 
   <rect x="1" y="1" width="1198" height="258" rx="14" fill="url(#bg)" stroke="#C8AA6E" stroke-opacity="0.35" stroke-width="1.5"/>
   <rect x="9" y="9" width="1182" height="242" rx="10" fill="none" stroke="#0AC8B9" stroke-opacity="0.18" stroke-width="1"/>
 
   <!-- corner glyphs, matching the app's own corner-bracket motif -->
-  <g stroke="#C8AA6E" stroke-opacity="0.55" stroke-width="1.5" fill="none">
-    <path d="M22 34 V20 H36"/>
-    <path d="M1178 34 V20 H1164"/>
-    <path d="M22 226 V240 H36"/>
-    <path d="M1178 226 V240 H1164"/>
+  <g stroke="#C8AA6E" stroke-width="1.5" fill="none">
+    <path class="hx-corner" d="M22 34 V20 H36" style="animation-delay:0s"/>
+    <path class="hx-corner" d="M1178 34 V20 H1164" style="animation-delay:.8s"/>
+    <path class="hx-corner" d="M22 226 V240 H36" style="animation-delay:1.6s"/>
+    <path class="hx-corner" d="M1178 226 V240 H1164" style="animation-delay:2.4s"/>
   </g>
 
   <text x="600" y="60" text-anchor="middle" font-family="Georgia, 'Times New Roman', serif" font-size="13" letter-spacing="6" fill="#8A8272">SESSION · RANKED · LCU API</text>
@@ -32,38 +63,43 @@
   <text x="600" y="108" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-weight="700" font-size="42" letter-spacing="3" fill="url(#titlefade)">HEXTECH DRAFT</text>
 
   <rect x="260" y="128" width="680" height="1.5" fill="url(#goldline)"/>
+  <g clip-path="url(#scanClip)">
+    <rect class="hx-beam" x="0" y="124" width="60" height="10" fill="#0AC8B9" fill-opacity="0.45"/>
+  </g>
 
   <text x="600" y="160" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="18" fill="#F0E6D2">Every click before the loading screen — automated.</text>
 
   <!-- feature chip row -->
   <g font-family="Arial, Helvetica, sans-serif" font-size="13" font-weight="600">
-    <g transform="translate(40,196)">
+    <g class="hx-chip" transform="translate(40,196)" style="color:#00FF9C">
       <rect width="168" height="34" rx="7" fill="#00FF9C" fill-opacity="0.07" stroke="#00FF9C" stroke-opacity="0.35"/>
       <text x="84" y="22" text-anchor="middle" fill="#00FF9C">🟢 Auto-Accept</text>
     </g>
-    <g transform="translate(222,196)">
+    <g class="hx-chip" transform="translate(222,196)" style="color:#0AC8B9">
       <rect width="168" height="34" rx="7" fill="#0AC8B9" fill-opacity="0.08" stroke="#0AC8B9" stroke-opacity="0.4"/>
       <text x="84" y="22" text-anchor="middle" fill="#0AC8B9">🧠 Smart Pick</text>
     </g>
-    <g transform="translate(404,196)">
+    <g class="hx-chip" transform="translate(404,196)" style="color:#C8AA6E">
       <rect width="168" height="34" rx="7" fill="#C8AA6E" fill-opacity="0.08" stroke="#C8AA6E" stroke-opacity="0.45"/>
       <text x="84" y="22" text-anchor="middle" fill="#C8AA6E">🗺️ Lane-Aware Pool</text>
     </g>
-    <g transform="translate(586,196)">
+    <g class="hx-chip" transform="translate(586,196)" style="color:#0AC8B9">
       <rect width="148" height="34" rx="7" fill="#0AC8B9" fill-opacity="0.08" stroke="#0AC8B9" stroke-opacity="0.4"/>
       <text x="74" y="22" text-anchor="middle" fill="#0AC8B9">📖 Runes &amp; Spells</text>
     </g>
-    <g transform="translate(748,196)">
+    <g class="hx-chip" transform="translate(748,196)" style="color:#C8AA6E">
       <rect width="148" height="34" rx="7" fill="#C8AA6E" fill-opacity="0.08" stroke="#C8AA6E" stroke-opacity="0.45"/>
       <text x="74" y="22" text-anchor="middle" fill="#C8AA6E">🛒 Item Builds</text>
     </g>
-    <g transform="translate(910,196)">
+    <g class="hx-chip" transform="translate(910,196)" style="color:#FF4E50">
       <rect width="130" height="34" rx="7" fill="#FF4E50" fill-opacity="0.07" stroke="#FF4E50" stroke-opacity="0.35"/>
       <text x="65" y="22" text-anchor="middle" fill="#FF4E50">🛡️ Anti-AFK</text>
     </g>
-    <g transform="translate(1052,196)">
+    <g class="hx-chip" transform="translate(1052,196)" style="color:#C8AA6E">
       <rect width="108" height="34" rx="7" fill="#C8AA6E" fill-opacity="0.08" stroke="#C8AA6E" stroke-opacity="0.45"/>
       <text x="54" y="22" text-anchor="middle" fill="#C8AA6E">★ Favorites</text>
     </g>
+  </g>
+
   </g>
 </svg>
