@@ -11,7 +11,7 @@ IS_WINDOWS = sys.platform == "win32"
 # ═══════════════════════════════════════════════════════════════
 #  VERSION & AUTO-UPDATE
 # ═══════════════════════════════════════════════════════════════
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.1.1"
 GITHUB_REPO = "jimman0I/League-Auto-Accept-Enhanced-Menu"  # owner/repo used for auto-update checks
 
 def check_for_update(log=None):
@@ -69,16 +69,53 @@ def download_update(exe_url, log=None):
                 if total:
                     pct = int(downloaded*100/total)
                     if pct % 20 == 0:_log(f"[DEBUG] Downloading... {pct}%")
+        # A truncated/interrupted download (connection drop, proxy cutting the
+        # stream short) can still land here without requests raising — verify
+        # we actually got the full file, and sanity-check against a known-small
+        # floor, before this is ever trusted enough to replace the running exe.
+        if total and downloaded != total:
+            _log(f"[DEBUG] Download incomplete: got {downloaded} of {total} bytes")
+            try:os.remove(new_path)
+            except Exception:pass
+            return False
+        if downloaded < 5_000_000:
+            _log(f"[DEBUG] Downloaded file too small ({downloaded} bytes) — refusing to install")
+            try:os.remove(new_path)
+            except Exception:pass
+            return False
         _log(f"[SUCCESS] Downloaded update to {os.path.basename(new_path)}")
-        # Create a batch script to replace the exe and restart
+        # Create a batch script to replace the exe and restart. Renames the
+        # running exe aside as a backup instead of deleting it outright, and
+        # restores that backup if the move-in fails for any reason — a failed
+        # update should never leave the user with no exe at all. Retries the
+        # rename for a few seconds in case the OS/AV still has a brief handle
+        # on the file right after this process exits.
         if IS_WINDOWS and getattr(sys,'frozen',False):
             bat = os.path.join(os.path.dirname(current),"_update.bat")
+            backup = current + ".bak"
             with open(bat,'w') as f:
-                f.write(f'@echo off\ntimeout /t 2 /nobreak >nul\n')
-                f.write(f'del "{current}"\n')
-                f.write(f'move "{new_path}" "{current}"\n')
+                f.write('@echo off\n')
+                f.write('setlocal enabledelayedexpansion\n')
+                f.write('set "tries=0"\n')
+                f.write(':retry\n')
+                f.write('set /a tries+=1\n')
+                f.write(f'move /y "{current}" "{backup}" >nul 2>&1\n')
+                f.write(f'if exist "{current}" (\n')
+                f.write('  if !tries! lss 10 (timeout /t 1 /nobreak >nul & goto retry)\n')
+                f.write('  echo Update failed: could not move aside the running exe.\n')
+                f.write('  exit /b 1\n')
+                f.write(')\n')
+                f.write(f'move /y "{new_path}" "{current}" >nul 2>&1\n')
+                f.write(f'if not exist "{current}" (\n')
+                f.write(f'  move /y "{backup}" "{current}" >nul 2>&1\n')
+                f.write('  echo Update failed: restored the previous version.\n')
+                f.write(f'  start "" "{current}"\n')
+                f.write('  del "%~f0"\n')
+                f.write('  exit /b 1\n')
+                f.write(')\n')
+                f.write(f'del "{backup}" >nul 2>&1\n')
                 f.write(f'start "" "{current}"\n')
-                f.write(f'del "%~f0"\n')
+                f.write('del "%~f0"\n')
             _log("[SUCCESS] Update ready — restart the app to apply")
             return bat
         return new_path
@@ -3153,12 +3190,52 @@ def _acquire_single_instance_lock():
     except Exception:
         pass  # never block startup over the lock mechanism itself
 
+def _icon_path():
+    """hextech_icon.ico, resolved for both dev (next to this script) and the
+    frozen onefile exe (extracted into sys._MEIPASS). The --icon flag on the
+    PyInstaller build only sets the exe's own file/shortcut icon — pywebview's
+    actual window (titlebar + the live taskbar button while it's running)
+    needs this path handed to webview.start() separately, or it falls back
+    to pywebview's own generic default icon."""
+    base=getattr(sys,'_MEIPASS',os.path.dirname(os.path.abspath(__file__)))
+    path=os.path.join(base,'hextech_icon.ico')
+    return path if os.path.exists(path) else None
+
+def _set_window_icon_win32(title):
+    """pywebview's own `icon=` start() kwarg is documented as GTK/QT only —
+    on Windows it's unreliable (falls back to extracting an icon off
+    sys.executable, which in dev mode is python.exe, not this script), so
+    the titlebar/taskbar icon silently stays generic. Setting it directly
+    via WM_SETICON on the real HWND works regardless of what pywebview's
+    backend does internally. Runs on its own thread since the window isn't
+    guaranteed to exist yet when main() calls this — polls briefly for it."""
+    if not IS_WINDOWS:return
+    icon_path=_icon_path()
+    if not icon_path:return
+    try:
+        import ctypes
+        user32=ctypes.windll.user32
+        hwnd=0
+        for _ in range(100):  # up to ~10s for the window to appear
+            hwnd=user32.FindWindowW(None,title)
+            if hwnd:break
+            time.sleep(0.1)
+        if not hwnd:return
+        LR_LOADFROMFILE=0x00000010;IMAGE_ICON=1;WM_SETICON=0x0080;ICON_SMALL=0;ICON_BIG=1
+        big=user32.LoadImageW(None,icon_path,IMAGE_ICON,32,32,LR_LOADFROMFILE)
+        small=user32.LoadImageW(None,icon_path,IMAGE_ICON,16,16,LR_LOADFROMFILE)
+        if big:user32.SendMessageW(hwnd,WM_SETICON,ICON_BIG,big)
+        if small:user32.SendMessageW(hwnd,WM_SETICON,ICON_SMALL,small)
+    except Exception:
+        pass  # cosmetic only — never worth crashing startup over
+
 def main():
     _acquire_single_instance_lock()
     import webview
     api=Api()
     window=webview.create_window('Hextech Draft',html=HTML,js_api=api,width=1200,height=820,resizable=True,background_color='#010A13')
-    webview.start()
+    threading.Thread(target=_set_window_icon_win32,args=('Hextech Draft',),daemon=True).start()
+    webview.start(icon=_icon_path())
 
 if __name__=='__main__':
     main()
