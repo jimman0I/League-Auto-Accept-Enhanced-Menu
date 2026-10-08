@@ -11,7 +11,7 @@ IS_WINDOWS = sys.platform == "win32"
 # ═══════════════════════════════════════════════════════════════
 #  VERSION & AUTO-UPDATE
 # ═══════════════════════════════════════════════════════════════
-APP_VERSION = "1.1.1"
+APP_VERSION = "1.1.2"
 GITHUB_REPO = "jimman0I/League-Auto-Accept-Enhanced-Menu"  # owner/repo used for auto-update checks
 
 def check_for_update(log=None):
@@ -1503,6 +1503,16 @@ class Engine(threading.Thread):
                     c=champs_by_name.get(entry['name'].lower())
                     if c and c['id'] not in unavail:candidates[c['id']]=c
             candidates=list(candidates.values())
+            # Autofilled into a role you've never favorited anyone for (and no
+            # global favorites either) would otherwise leave Smart Pick with
+            # nothing to suggest. Fall back to the meta pool for that role —
+            # same data 'all' mode uses — so there's always a suggestion.
+            if not candidates:
+                fallback={}
+                for entry in _ensemble_role_pool(role,log=self.log):
+                    c=champs_by_name.get(entry['name'].lower())
+                    if c and c['id'] not in unavail:fallback[c['id']]=c
+                candidates=list(fallback.values())
             if not candidates:
                 self.smart_pick_suggestion=None;self.smart_pick_alternatives=[];return
             ally_profile=_comp_profile(ally_ids,champs_by_id)
