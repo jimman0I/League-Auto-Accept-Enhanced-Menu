@@ -11,7 +11,7 @@ IS_WINDOWS = sys.platform == "win32"
 # ═══════════════════════════════════════════════════════════════
 #  VERSION & AUTO-UPDATE
 # ═══════════════════════════════════════════════════════════════
-APP_VERSION = "1.1.2"
+APP_VERSION = "1.1.3"
 GITHUB_REPO = "jimman0I/League-Auto-Accept-Enhanced-Menu"  # owner/repo used for auto-update checks
 
 def check_for_update(log=None):
@@ -1231,7 +1231,7 @@ class Config:
             for k in self.ROLE_KEYS: self.roles[r][k]='None' if 'name' in k else None
         self.chat_on=False;self.chat_msg="GLHF";self.auto_accept=True;self.afk_on=False;self.afk_threshold=30
         self.auto_pick=True;self.auto_ban=True;self.auto_spells=False;self.auto_runes=False;self.auto_items=False;self.sound_alert=True
-        self.light_mode=False;self.lite_mode=False;self.favorites=[];self.auto_minimize=False;self.region='eune';self.build_source=''
+        self.light_mode=False;self.lite_mode=False;self.favorites=[];self.auto_minimize=True;self.region='eune';self.build_source=''
         self.smart_pick_pool='favorites';self.favorite_tags={};self.build_style_tags={};self.favorites_by_role={}
     def snap(self,role='TOP'):
         with self.lock:
@@ -3076,6 +3076,12 @@ var r=JSON.parse(await pywebview.api.do_update(pendingUpdateUrl));
 if(!r.success){await dlgAlert('Download Failed','Try downloading manually from GitHub.')}}catch(e){await dlgAlert('Update Failed',String(e))}}
 
 async function poll(){try{var s=JSON.parse(await pywebview.api.get_status());
+// Minimized mid-game: nothing on screen to update, so skip the DOM rebuild
+// work below entirely (log list, live picks/bans, stat text) — it was
+// running full-cost every 300ms for a window nobody can see, competing
+// with the game for CPU the whole match. Still check phase so this un-skips
+// itself the instant the game ends.
+if(window._minimized&&s.phase==='InProgress')return;
 document.getElementById('dot').className='dot'+(s.connected?' on':'');
 document.getElementById('sn').textContent=s.connected?s.summoner:'Searching...';
 document.getElementById('sn').style.color=s.connected?'var(--text)':'var(--textm)';
