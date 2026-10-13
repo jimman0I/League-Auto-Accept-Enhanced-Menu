@@ -23,6 +23,11 @@
     <clipPath id="scanClip">
       <rect x="260" y="124" width="680" height="10"/>
     </clipPath>
+    <linearGradient id="beamglow" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#0AC8B9" stop-opacity="0"/>
+      <stop offset="50%" stop-color="#0AC8B9" stop-opacity="0.85"/>
+      <stop offset="100%" stop-color="#0AC8B9" stop-opacity="0"/>
+    </linearGradient>
 
     <!-- Hand-drawn line icons, 24x24 grid — no emoji font, renders identically
          everywhere instead of falling back to a generic glyph on hosts
@@ -100,7 +105,7 @@
 
   <rect x="260" y="128" width="680" height="1.5" fill="url(#goldline)"/>
   <g clip-path="url(#scanClip)">
-    <rect class="hx-beam" x="0" y="124" width="60" height="10" fill="#0AC8B9" fill-opacity="0.45"/>
+    <rect class="hx-beam" x="0" y="126.5" width="160" height="3" fill="url(#beamglow)"/>
   </g>
 
   <text x="600" y="160" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="18" fill="#F0E6D2">Every click before the loading screen — automated.</text>
