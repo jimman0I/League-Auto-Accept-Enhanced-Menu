@@ -11,7 +11,7 @@ IS_WINDOWS = sys.platform == "win32"
 # ═══════════════════════════════════════════════════════════════
 #  VERSION & AUTO-UPDATE
 # ═══════════════════════════════════════════════════════════════
-APP_VERSION = "1.1.3"
+APP_VERSION = "1.1.4"
 GITHUB_REPO = "jimman0I/League-Auto-Accept-Enhanced-Menu"  # owner/repo used for auto-update checks
 
 def check_for_update(log=None):
@@ -3193,7 +3193,16 @@ def _acquire_single_instance_lock():
             with open(lock_path) as f:
                 old_pid=int((f.read() or '0').strip() or 0)
             import psutil
+            # pid_exists alone isn't enough — Windows recycles PIDs, so a lock
+            # left behind by a crashed/killed instance can point at a PID that
+            # now belongs to some unrelated process (seen in practice: an old
+            # HextechDraft PID reassigned to LeagueClient.exe), making a dead
+            # lock look "still running" forever. Confirm the name matches too.
+            still_running=False
             if old_pid and psutil.pid_exists(old_pid):
+                try:still_running=psutil.Process(old_pid).name().lower()==os.path.basename(sys.executable).lower()
+                except Exception:still_running=False
+            if still_running:
                 try:
                     import ctypes
                     ctypes.windll.user32.MessageBoxW(0,"Hextech Draft is already running.","Hextech Draft",0x40)
